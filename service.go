@@ -102,6 +102,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, in RegisterSnapshotInput
 			CreatedAt: s.timeNow(),
 		}
 		tx.PutSnapshot(snap)
+		tx.BumpDatasetVersion(in.DatasetID)
 		out = cloneSnapshot(&snap)
 		return nil
 	})
@@ -670,6 +671,17 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			}
 			for _, f := range task.Chain {
 				addReason(f.SnapshotID, ReasonActiveRestore)
+			}
+		}
+
+		// (1b) 有效压缩任务冻结的原链一律保留：发布前读者仍走原链，
+		// 发布后原链也要等到不再被任何引用才逐个回收。
+		for _, task := range tx.ListCompactions() {
+			if !task.Active() {
+				continue
+			}
+			for _, f := range task.Chain {
+				addReason(f.SnapshotID, ReasonActiveCompaction)
 			}
 		}
 

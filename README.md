@@ -1,6 +1,6 @@
 # go-backup-restore
 
-增量备份链的安全恢复与保留清理服务（Go 1.23，零第三方依赖）。
+增量备份链的安全恢复、链压缩与保留清理服务（Go 1.23，零第三方依赖）。
 
 ## 能力概览
 
@@ -12,6 +12,8 @@
 | 租约接管 | `TakeoverLease` | epoch 单调递增，旧租约回执一律失效 |
 | 任务完成 | `CompleteRestore` | 写出且只写出一次 outbox 通知，重复调用幂等 |
 | 保留清理 | `RunRetention` | 一致快照上决策，逐条记录原因并落库 |
+| 链压缩 | `CreateCompaction` / `DispatchCompactionStep` / `AckCompactionStep` / `PublishCompaction` | 把一段已完成的快照链合成为新的完整快照 |
+| 压缩查询 | `GetCompactionTask` / `GetCompactionProgress` / `GetCompactionChains` / `GetReplacement` / `ExplainSnapshotReferences` | 进度、新旧链、替代关系与引用阻断原因 |
 | 备份链查询 | `GetBackupChain` / `ListDatasetSnapshots` / `GetRestoreTask` / `ListLeaseEvents` / `ListRetentionRuns` / `ListOutboxEvents` | 只读视图 |
 
 ## 核心规则
@@ -39,12 +41,37 @@
 - `CompleteRestore` 要求全部步骤成功；完成时写出**唯一一条** outbox 通知
   （存储层 `outbox_by_task` 唯一约束兜底），重复完成幂等返回同一事件。
 
-### 3. 保留清理
+### 3. 链压缩
+
+- `CreateCompaction` 在**单个事务**内完成：校验起点为完整快照、终点与起点
+  在同一数据集且终点可沿父边回溯到起点（链连续）、链上快照**全部已完成**；
+  随后**冻结**起点、终点、链上每个快照的 ID 与摘要、当前数据集版本
+  （每次快照登记/压缩发布都会递增），并由冻结链确定性推导出
+  `ExpectedDigest`。冻结后链内容不可变，冻结视图即执行依据。
+- `IdempotencyKey` 即任务号：相同键的重复创建幂等返回同一任务
+  （含已完成任务），不会生成重复压缩。
+- 执行与恢复共用同一套 fencing 语义：步骤沿冻结链**有序**派发、失败可重试，
+  每次派发递增 `ExecutionVersion`；回执必须同时匹配**租约 ID + epoch** 与
+  **执行版本**。`TakeoverCompactionLease` 换发租约并递增 epoch 后，
+  旧租约持有者的任何回执都无法推进新接管者的任务。
+- `PublishCompaction` 只有在**内容摘要校验通过**（执行方上报的 digest 等于
+  冻结链推导的 `ExpectedDigest`）且冻结链快照仍完整存在时，才在**同一事务**
+  内原子发布：新完整快照直接以 `completed` 状态出现、记录每个原快照到新
+  快照的**替代关系**、写出唯一一条 `compaction_completed` outbox 通知。
+  发布前读者只看到原链，不存在半成品；同一链的并发压缩**最多一个**
+  发布成功（后到者因链已被替代而冲突）。重复发布幂等返回既有结果。
+- 发布后原链**不立即删除**：`RunRetention` 只有在没有有效恢复任务、
+  保留规则、有效压缩任务或未完成子快照引用时，才逐个回收原链快照；
+  替代关系（`GetReplacement`）在回收后仍可查询。恢复创建与回收并发时，
+  可序列化事务保证恢复要么冻结到完整链、要么失败，绝不得到断裂链。
+
+### 4. 保留清理
 
 - `RunRetention` 在**单个可序列化事务**内从一致快照作出全部决定，
   与快照登记、恢复创建并发时不会读到中间状态。
 - 以下内容一律保留（原因写入决策记录）：
   - 仍被**有效恢复链**冻结的快照（`active_restore`）；
+  - 仍被**有效压缩任务**冻结的原链快照（`active_compaction`）；
   - 命中**保留策略**的最近 N 个已完成快照及其全部祖先
     （`retention_policy` / `ancestor_of_retained_snapshot`）；
   - **未完成（pending）子快照**自身及其祖先链
@@ -52,7 +79,7 @@
 - 其余快照删除并记录原因：过期完成快照 `expired_and_unreferenced`，
   失败快照 `failed_and_unreferenced`。每次运行落库一条 `RetentionRun`。
 
-### 4. 持久化与错误分类
+### 5. 持久化与错误分类
 
 - 存储接口 `Store`（`Update`/`View`）保证事务串行、视图一致：
   - `NewMemoryStore()`：进程内实现，适合测试；
@@ -100,6 +127,25 @@ svc.CompleteRestore(ctx, task.ID, task.LeaseID, task.LeaseEpoch)
 // 5. 保留清理：保留每数据集最近 3 个已完成快照及其依赖
 svc.RunRetention(ctx, []backuprestore.RetentionRule{
     {DatasetID: "ds", KeepLatestCompleted: 3}})
+
+// 6. 链压缩：把 full -> inc 这段已完成的链合成为新的完整快照
+cmp, _ := svc.CreateCompaction(ctx, backuprestore.CreateCompactionInput{
+    IdempotencyKey: "ds-2026-09", StartSnapshotID: full.ID, EndSnapshotID: inc.ID,
+    Holder: "compactor-1"})
+for {
+    d, _ := svc.DispatchCompactionStep(ctx, cmp.ID, cmp.LeaseID, cmp.LeaseEpoch)
+    if d.Step == nil {
+        break
+    }
+    // ... 把该快照内容合并进 staging ...
+    svc.AckCompactionStep(ctx, backuprestore.AckStepInput{
+        TaskID: cmp.ID, LeaseID: cmp.LeaseID, Epoch: cmp.LeaseEpoch,
+        StepIndex: d.Step.Index, ExecutionVersion: d.Step.ExecutionVersion,
+        Success: true})
+}
+// 摘要校验通过后原子发布；此后原链由保留清理在无人引用时逐个回收
+pub, _ := svc.PublishCompaction(ctx, cmp.ID, cmp.LeaseID, cmp.LeaseEpoch, cmp.ExpectedDigest)
+newID, _, _ := svc.GetReplacement(ctx, inc.ID) // == pub.NewSnapshot.ID
 ```
 
 ## 测试
@@ -113,14 +159,18 @@ go test -race ./...    # 含并发竞态检测
 恢复创建（冻结链、环境唯一租约、不可恢复快照）、步骤有序派发与重试、
 回执的租约/版本匹配、租约接管 fencing、outbox 恰好一次、保留清理的
 保护规则与原因记录、并发下“同一环境仅一个有效恢复”与“清理不删被引用快照”、
-FileStore 重启恢复与事务回滚。
+FileStore 重启恢复与事务回滚；链压缩的创建冻结（数据集版本/链摘要）、
+任务号幂等、步骤重试与租约 fencing、摘要校验与原子发布、并发压缩唯一胜者、
+发布后原链的引用阻断与逐个回收、恢复创建与回收竞争不产生断裂链、
+压缩状态持久化。
 
 ## 代码结构
 
 ```
-domain.go   领域模型：快照、冻结链、恢复任务、步骤、租约事件、outbox、保留决策
-errors.go   错误分类（ErrorCode）与 *Error
-store.go    事务式 Store 接口、内存实现、原子落盘的 FileStore
-service.go  业务规则：登记/恢复/回执/接管/保留/查询
-*_test.go   自动化测试（含 -race 并发用例）
+domain.go      领域模型：快照、冻结链、恢复/压缩任务、步骤、租约事件、outbox、保留决策
+errors.go      错误分类（ErrorCode）与 *Error
+store.go       事务式 Store 接口、内存实现、原子落盘的 FileStore
+service.go     业务规则：登记/恢复/回执/接管/保留/查询
+compaction.go  链压缩：创建冻结/步骤执行/租约接管/摘要校验与原子发布/替代关系查询
+*_test.go      自动化测试（含 -race 并发用例）
 ```

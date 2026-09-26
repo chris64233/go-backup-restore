@@ -14,22 +14,62 @@ import (
 // 提交成功后整体替换，因此每个事务都工作在一个可序列化的一致快照上：
 // 保留清理看到的引用关系，绝不会是快照登记/恢复创建执行到一半的中间状态。
 type state struct {
-	Snapshots     map[string]*Snapshot    `json:"snapshots"`
-	Tasks         map[string]*RestoreTask `json:"tasks"`
-	Outbox        map[string]*OutboxEvent `json:"outbox"`
-	OutboxByTask  map[string]string       `json:"outbox_by_task"`
-	LeaseEvents   []LeaseEvent            `json:"lease_events"`
-	RetentionRuns []*RetentionRun         `json:"retention_runs"`
-	IDSeq         map[string]int64        `json:"id_seq"`
+	Snapshots       map[string]*Snapshot       `json:"snapshots"`
+	Tasks           map[string]*RestoreTask    `json:"tasks"`
+	Compactions     map[string]*CompactionTask `json:"compactions"`
+	CompactionByKey map[string]string          `json:"compaction_by_key"`
+	Replacements    map[string]string          `json:"replacements"` // 原快照 ID -> 压缩产生的新完整快照 ID
+	DatasetVersion  map[string]int64           `json:"dataset_version"`
+	Outbox          map[string]*OutboxEvent    `json:"outbox"`
+	OutboxByTask    map[string]string          `json:"outbox_by_task"`
+	LeaseEvents     []LeaseEvent               `json:"lease_events"`
+	RetentionRuns   []*RetentionRun            `json:"retention_runs"`
+	IDSeq           map[string]int64           `json:"id_seq"`
 }
 
 func newState() *state {
 	return &state{
-		Snapshots:    map[string]*Snapshot{},
-		Tasks:        map[string]*RestoreTask{},
-		Outbox:       map[string]*OutboxEvent{},
-		OutboxByTask: map[string]string{},
-		IDSeq:        map[string]int64{},
+		Snapshots:       map[string]*Snapshot{},
+		Tasks:           map[string]*RestoreTask{},
+		Compactions:     map[string]*CompactionTask{},
+		CompactionByKey: map[string]string{},
+		Replacements:    map[string]string{},
+		DatasetVersion:  map[string]int64{},
+		Outbox:          map[string]*OutboxEvent{},
+		OutboxByTask:    map[string]string{},
+		IDSeq:           map[string]int64{},
+	}
+}
+
+// normalize 补齐旧版本状态文件中缺失的映射，保证反序列化后的状态可直接使用。
+func (s *state) normalize() {
+	fresh := newState()
+	if s.Snapshots == nil {
+		s.Snapshots = fresh.Snapshots
+	}
+	if s.Tasks == nil {
+		s.Tasks = fresh.Tasks
+	}
+	if s.Compactions == nil {
+		s.Compactions = fresh.Compactions
+	}
+	if s.CompactionByKey == nil {
+		s.CompactionByKey = fresh.CompactionByKey
+	}
+	if s.Replacements == nil {
+		s.Replacements = fresh.Replacements
+	}
+	if s.DatasetVersion == nil {
+		s.DatasetVersion = fresh.DatasetVersion
+	}
+	if s.Outbox == nil {
+		s.Outbox = fresh.Outbox
+	}
+	if s.OutboxByTask == nil {
+		s.OutboxByTask = fresh.OutboxByTask
+	}
+	if s.IDSeq == nil {
+		s.IDSeq = fresh.IDSeq
 	}
 }
 
@@ -40,6 +80,18 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.Tasks {
 		c.Tasks[k] = cloneTask(v)
+	}
+	for k, v := range s.Compactions {
+		c.Compactions[k] = cloneCompaction(v)
+	}
+	for k, v := range s.CompactionByKey {
+		c.CompactionByKey[k] = v
+	}
+	for k, v := range s.Replacements {
+		c.Replacements[k] = v
+	}
+	for k, v := range s.DatasetVersion {
+		c.DatasetVersion[k] = v
 	}
 	for k, v := range s.Outbox {
 		cv := *v
@@ -88,6 +140,42 @@ func cloneTask(t *RestoreTask) *RestoreTask {
 			cs.UpdatedAt = &tt
 		}
 		c.Steps[i] = cs
+	}
+	if t.StartedAt != nil {
+		tt := *t.StartedAt
+		c.StartedAt = &tt
+	}
+	if t.CompletedAt != nil {
+		tt := *t.CompletedAt
+		c.CompletedAt = &tt
+	}
+	return &c
+}
+
+func cloneCompaction(t *CompactionTask) *CompactionTask {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	c.Chain = append([]FrozenSnapshot(nil), t.Chain...)
+	c.Steps = make([]CompactionStep, len(t.Steps))
+	for i, st := range t.Steps {
+		cs := st
+		if st.StartedAt != nil {
+			tt := *st.StartedAt
+			cs.StartedAt = &tt
+		}
+		if st.UpdatedAt != nil {
+			tt := *st.UpdatedAt
+			cs.UpdatedAt = &tt
+		}
+		c.Steps[i] = cs
+	}
+	if t.Replacements != nil {
+		c.Replacements = make(map[string]string, len(t.Replacements))
+		for k, v := range t.Replacements {
+			c.Replacements[k] = v
+		}
 	}
 	if t.StartedAt != nil {
 		tt := *t.StartedAt
@@ -200,6 +288,47 @@ func (tx *Tx) ListTasks() []*RestoreTask {
 	return out
 }
 
+func (tx *Tx) GetCompaction(id string) (*CompactionTask, bool) {
+	t, ok := tx.st.Compactions[id]
+	return t, ok
+}
+
+// GetCompactionByKey 按任务号（幂等键）查找压缩任务。
+func (tx *Tx) GetCompactionByKey(key string) (*CompactionTask, bool) {
+	id, ok := tx.st.CompactionByKey[key]
+	if !ok {
+		return nil, false
+	}
+	t, ok := tx.st.Compactions[id]
+	return t, ok
+}
+
+// ListCompactions 按创建时间列出全部压缩任务。
+func (tx *Tx) ListCompactions() []*CompactionTask {
+	out := make([]*CompactionTask, 0, len(tx.st.Compactions))
+	for _, t := range tx.st.Compactions {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// GetReplacement 返回原快照被压缩替代后的新完整快照 ID。
+func (tx *Tx) GetReplacement(oldSnapshotID string) (string, bool) {
+	id, ok := tx.st.Replacements[oldSnapshotID]
+	return id, ok
+}
+
+// DatasetVersionNow 返回数据集当前版本（每次快照登记递增）。
+func (tx *Tx) DatasetVersionNow(datasetID string) int64 {
+	return tx.st.DatasetVersion[datasetID]
+}
+
 func (tx *Tx) GetOutboxEvent(id string) (*OutboxEvent, bool) {
 	e, ok := tx.st.Outbox[id]
 	return e, ok
@@ -257,6 +386,25 @@ func (tx *Tx) DeleteSnapshot(id string) {
 }
 
 func (tx *Tx) PutTask(t RestoreTask) { tx.st.Tasks[t.ID] = &t }
+
+// PutCompaction 写入压缩任务；任务号非空时同时登记幂等键索引。
+func (tx *Tx) PutCompaction(t CompactionTask) {
+	tx.st.Compactions[t.ID] = &t
+	if t.IdempotencyKey != "" {
+		tx.st.CompactionByKey[t.IdempotencyKey] = t.ID
+	}
+}
+
+// PutReplacement 记录原快照 -> 新完整快照的替代关系。
+func (tx *Tx) PutReplacement(oldSnapshotID, newSnapshotID string) {
+	tx.st.Replacements[oldSnapshotID] = newSnapshotID
+}
+
+// BumpDatasetVersion 递增数据集版本并返回新值（快照登记时调用）。
+func (tx *Tx) BumpDatasetVersion(datasetID string) int64 {
+	tx.st.DatasetVersion[datasetID]++
+	return tx.st.DatasetVersion[datasetID]
+}
 
 // AddOutboxEvent 写入通知事件；每个任务最多一条，重复写入返回 conflict，
 // 使“任务完成只能写出一次 outbox”在存储层也有兜底保证。
@@ -351,9 +499,7 @@ func NewFileStore(path string) (*FileStore, error) {
 			if err := json.Unmarshal(data, loaded); err != nil {
 				return nil, wrapErr(ErrCodeUnavailable, err, "load state from %s", path)
 			}
-			if loaded.Snapshots == nil {
-				loaded = newState()
-			}
+			loaded.normalize()
 			fs.inner.root = loaded
 		}
 	case os.IsNotExist(err):
