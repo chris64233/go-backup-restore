@@ -2,6 +2,9 @@ package backuprestore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"sort"
 	"time"
 )
@@ -102,6 +105,7 @@ func (s *Service) RegisterSnapshot(ctx context.Context, in RegisterSnapshotInput
 			CreatedAt: s.timeNow(),
 		}
 		tx.PutSnapshot(snap)
+		tx.BumpDatasetVersion(in.DatasetID)
 		out = cloneSnapshot(&snap)
 		return nil
 	})
@@ -613,9 +617,11 @@ func (s *Service) ListLeaseEvents(ctx context.Context, taskID string) ([]LeaseEv
 
 // RunRetention 在单个事务的一致快照上作出保留/删除决定：
 //   - 仍被有效恢复链冻结的快照，保留；
+//   - 仍被有效压缩任务冻结的原链快照，保留；
 //   - 命中保留策略的最近已完成快照及其全部祖先（增量链可用性），保留；
 //   - 未完成（pending）子快照本身及其祖先，保留；
-//   - 其余快照删除，失败快照与过期已完成快照分别记录原因。
+//   - 其余快照删除：被压缩替代的记录 replaced_by_compaction，
+//     失败快照与过期已完成快照分别记录原因。
 //
 // 每个决定（含原因）与实际删除在同一事务落库为一条 RetentionRun。
 func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*RetentionRun, error) {
@@ -673,6 +679,16 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			}
 		}
 
+		// (1b) 有效压缩任务冻结的链同样保留：压缩执行期间原链不得被回收。
+		for _, c := range tx.ListCompactions() {
+			if !c.Active() {
+				continue
+			}
+			for _, f := range c.Chain {
+				addReason(f.SnapshotID, ReasonActiveCompaction)
+			}
+		}
+
 		// (2) 保留策略：每个数据集最近 N 个已完成快照，外加它们的祖先链。
 		for datasetID, rule := range covered {
 			var completed []*Snapshot
@@ -720,6 +736,9 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			reason := ReasonExpiredUnreferenced
 			if sn.Status == StatusFailed {
 				reason = ReasonFailedUnreferenced
+			} else if _, replaced := tx.GetReplacement(sn.ID); replaced {
+				// 已被压缩结果替代、且不再被任何恢复/策略/子快照引用的原链节点。
+				reason = ReasonReplacedByCompaction
 			}
 			run.Decisions = append(run.Decisions, RetentionDecision{
 				SnapshotID: sn.ID, DatasetID: sn.DatasetID,
@@ -747,6 +766,666 @@ func (s *Service) ListRetentionRuns(ctx context.Context) ([]*RetentionRun, error
 		return nil
 	})
 	return out, err
+}
+
+// ---------------------------------------------------------------------------
+// 链压缩：一段已完成快照链 -> 新的完整快照
+// ---------------------------------------------------------------------------
+
+// CreateCompactionInput 创建压缩任务的入参。IdempotencyKey 是任务号：
+// 相同键重复创建返回同一任务，键相同但链不同则报 conflict。
+type CreateCompactionInput struct {
+	FromSnapshotID string // 起点，必须为完整快照（链根）
+	ToSnapshotID   string // 终点
+	Holder         string // 申请执行租约的执行方标识
+	IdempotencyKey string
+}
+
+// compactionExpectedDigest 由冻结链推导期望的内容摘要。
+// 执行方合并出的新完整快照必须带有该摘要才允许发布。
+func compactionExpectedDigest(datasetID string, chain []FrozenSnapshot) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "compaction/v1\ndataset=%s\n", datasetID)
+	for _, f := range chain {
+		fmt.Fprintf(h, "%d %s %s %s\n", f.Index, f.SnapshotID, f.Kind, f.Digest)
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
+}
+
+// walkSegment 从 to 沿父边回溯到 from（含两端），返回 from -> to 的有序切片。
+// from 不是 to 的祖先（链不连续）时报 invalid_argument。
+func walkSegment(tx *Tx, fromID, toID string) ([]*Snapshot, error) {
+	rev := make([]*Snapshot, 0)
+	visited := map[string]bool{}
+	curID := toID
+	for {
+		if visited[curID] {
+			return nil, classified(ErrCodeConflict, "cycle detected in snapshot ancestry at %s", curID)
+		}
+		visited[curID] = true
+		cur, ok := tx.GetSnapshot(curID)
+		if !ok {
+			return nil, classified(ErrCodeNotFound, "snapshot %s not found", curID)
+		}
+		rev = append(rev, cur)
+		if cur.ID == fromID {
+			break
+		}
+		if cur.Kind == KindFull {
+			return nil, classified(ErrCodeInvalidArgument,
+				"snapshot %s is not an ancestor of %s (reached chain root %s)", fromID, toID, cur.ID)
+		}
+		if cur.ParentID == "" {
+			return nil, classified(ErrCodeConflict, "incremental snapshot %s has no parent", cur.ID)
+		}
+		curID = cur.ParentID
+	}
+	out := make([]*Snapshot, len(rev))
+	for i, sn := range rev {
+		out[len(rev)-1-i] = sn
+	}
+	return out, nil
+}
+
+// CreateCompaction 在单个事务内：
+//  1. 幂等校验：任务号已存在时直接返回既有任务（链不一致则报 conflict）；
+//  2. 校验起点为完整快照、起点是终点沿父边的祖先、链上快照全部已完成且同数据集；
+//  3. 冻结起点、终点、链中每个快照的摘要与当前数据集版本；
+//  4. 取得执行租约（epoch 从 1 开始，语义与恢复租约一致）。
+func (s *Service) CreateCompaction(ctx context.Context, in CreateCompactionInput) (*CompactionTask, error) {
+	if in.FromSnapshotID == "" || in.ToSnapshotID == "" || in.Holder == "" || in.IdempotencyKey == "" {
+		return nil, classified(ErrCodeInvalidArgument,
+			"from/to snapshot id, holder and idempotency key are required")
+	}
+	var out *CompactionTask
+	err := s.store.Update(func(tx *Tx) error {
+		if existing, ok := tx.FindCompactionByKey(in.IdempotencyKey); ok {
+			if existing.FromSnapshotID != in.FromSnapshotID || existing.ToSnapshotID != in.ToSnapshotID {
+				return classified(ErrCodeConflict,
+					"idempotency key %s already used by compaction %s with different chain (%s -> %s)",
+					in.IdempotencyKey, existing.ID, existing.FromSnapshotID, existing.ToSnapshotID)
+			}
+			out = cloneCompactionTask(existing)
+			return nil
+		}
+		from, ok := tx.GetSnapshot(in.FromSnapshotID)
+		if !ok {
+			return classified(ErrCodeNotFound, "snapshot %s not found", in.FromSnapshotID)
+		}
+		if from.Kind != KindFull {
+			return classified(ErrCodeInvalidArgument,
+				"compaction must start at a full snapshot, %s is %s", from.ID, from.Kind)
+		}
+		seg, err := walkSegment(tx, in.FromSnapshotID, in.ToSnapshotID)
+		if err != nil {
+			return err
+		}
+		if len(seg) < 2 {
+			return classified(ErrCodeInvalidArgument,
+				"compaction requires a chain of at least 2 snapshots")
+		}
+		for _, sn := range seg {
+			if sn.DatasetID != from.DatasetID {
+				return classified(ErrCodeConflict, "snapshot %s belongs to another dataset", sn.ID)
+			}
+			if sn.Status != StatusCompleted {
+				return classified(ErrCodeConflict,
+					"snapshot %s on chain is %s, only completed chains can be compacted", sn.ID, sn.Status)
+			}
+		}
+
+		now := s.timeNow()
+		frozen := make([]FrozenSnapshot, len(seg))
+		steps := make([]RestoreStep, len(seg))
+		for i, sn := range seg {
+			frozen[i] = FrozenSnapshot{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Kind: sn.Kind}
+			steps[i] = RestoreStep{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Status: StepPending}
+		}
+		leaseID := tx.NewID("lease")
+		task := CompactionTask{
+			ID:             tx.NewID("comp"),
+			IdempotencyKey: in.IdempotencyKey,
+			DatasetID:      from.DatasetID,
+			FromSnapshotID: from.ID,
+			ToSnapshotID:   in.ToSnapshotID,
+			Chain:          frozen,
+			DatasetVersion: tx.DatasetVersion(from.DatasetID),
+			Steps:          steps,
+			Status:         TaskPending,
+			LeaseID:        leaseID,
+			LeaseEpoch:     1,
+			LeaseHolder:    in.Holder,
+			CreatedAt:      now,
+		}
+		task.ExpectedDigest = compactionExpectedDigest(task.DatasetID, frozen)
+		tx.PutCompaction(task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: leaseID, Epoch: 1,
+			Holder: in.Holder, Action: LeaseAcquired,
+		})
+		out = cloneCompactionTask(&task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetCompactionTask 查询压缩任务（含冻结链、步骤与当前租约）。
+func (s *Service) GetCompactionTask(ctx context.Context, taskID string) (*CompactionTask, error) {
+	var out *CompactionTask
+	err := s.store.View(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", taskID)
+		}
+		out = cloneCompactionTask(task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListCompactionTasks 按创建顺序列出全部压缩任务。
+func (s *Service) ListCompactionTasks(ctx context.Context) ([]*CompactionTask, error) {
+	var out []*CompactionTask
+	err := s.store.View(func(tx *Tx) error {
+		for _, t := range tx.ListCompactions() {
+			out = append(out, cloneCompactionTask(t))
+		}
+		return nil
+	})
+	return out, err
+}
+
+// CompactionProgress 是压缩任务的进度视图。
+type CompactionProgress struct {
+	TaskID        string
+	Status        TaskStatus
+	Total         int
+	Pending       int
+	Running       int
+	Succeeded     int
+	Failed        int
+	NewSnapshotID string // 发布成功后为新完整快照 ID
+}
+
+// GetCompactionProgress 汇总任务的步骤进度。
+func (s *Service) GetCompactionProgress(ctx context.Context, taskID string) (*CompactionProgress, error) {
+	var out *CompactionProgress
+	err := s.store.View(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", taskID)
+		}
+		p := &CompactionProgress{
+			TaskID: task.ID, Status: task.Status,
+			Total: len(task.Steps), NewSnapshotID: task.NewSnapshotID,
+		}
+		for _, st := range task.Steps {
+			switch st.Status {
+			case StepPending:
+				p.Pending++
+			case StepRunning:
+				p.Running++
+			case StepSucceeded:
+				p.Succeeded++
+			case StepFailed:
+				p.Failed++
+			}
+		}
+		out = p
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// requireCompactionLease 校验压缩任务有效且租约 ID + epoch 完全匹配。
+func requireCompactionLease(task *CompactionTask, leaseID string, epoch int64) error {
+	if !task.Active() {
+		return classified(ErrCodeConflict, "compaction task %s is %s", task.ID, task.Status)
+	}
+	if task.LeaseID != leaseID || task.LeaseEpoch != epoch {
+		return classified(ErrCodeLease, "lease mismatch for compaction %s: current=%s epoch=%d, got=%s epoch=%d",
+			task.ID, task.LeaseID, task.LeaseEpoch, leaseID, epoch)
+	}
+	return nil
+}
+
+// CompactionDispatch 是一次压缩步骤派发的结果。Step 为 nil 表示没有可派发步骤。
+type CompactionDispatch struct {
+	Task *CompactionTask
+	Step *RestoreStep
+}
+
+// DispatchCompactionStep 沿冻结链有序派发下一个合并步骤，语义与恢复步骤一致：
+// 每次派发递增 ExecutionVersion，回执必须携带该版本。
+func (s *Service) DispatchCompactionStep(ctx context.Context, taskID, leaseID string, epoch int64) (*CompactionDispatch, error) {
+	res := &CompactionDispatch{}
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", taskID)
+		}
+		if err := requireCompactionLease(task, leaseID, epoch); err != nil {
+			return err
+		}
+		now := s.timeNow()
+		for i := range task.Steps {
+			step := &task.Steps[i]
+			if step.Status == StepSucceeded {
+				continue
+			}
+			if step.Status == StepRunning {
+				res.Task = cloneCompactionTask(task)
+				return nil
+			}
+			step.Status = StepRunning
+			step.ExecutionVersion++
+			step.Attempts++
+			if step.StartedAt == nil {
+				t := now
+				step.StartedAt = &t
+			}
+			t2 := now
+			step.UpdatedAt = &t2
+			if task.Status == TaskPending {
+				task.Status = TaskRunning
+				t3 := now
+				task.StartedAt = &t3
+			}
+			tx.PutCompaction(*task)
+			res.Task = cloneCompactionTask(task)
+			cp := *step
+			res.Step = &cp
+			return nil
+		}
+		res.Task = cloneCompactionTask(task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// AckCompactionStep 处理压缩步骤回执：租约或执行版本不匹配一律拒绝且状态不变；
+// 失败的步骤回到 failed 等待按序重试。
+func (s *Service) AckCompactionStep(ctx context.Context, in AckStepInput) (*RestoreStep, error) {
+	var out *RestoreStep
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(in.TaskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", in.TaskID)
+		}
+		if err := requireCompactionLease(task, in.LeaseID, in.Epoch); err != nil {
+			return err
+		}
+		if in.StepIndex < 0 || in.StepIndex >= len(task.Steps) {
+			return classified(ErrCodeInvalidArgument, "step index %d out of range (chain length %d)",
+				in.StepIndex, len(task.Steps))
+		}
+		step := &task.Steps[in.StepIndex]
+		if step.ExecutionVersion != in.ExecutionVersion {
+			return classified(ErrCodeConflict,
+				"stale receipt for compaction %s step %d: current execution version %d, receipt %d",
+				task.ID, step.Index, step.ExecutionVersion, in.ExecutionVersion)
+		}
+		if step.Status != StepRunning {
+			return classified(ErrCodeConflict, "compaction %s step %d is not running (status=%s)",
+				task.ID, step.Index, step.Status)
+		}
+		now := s.timeNow()
+		if in.Success {
+			if in.StepIndex > 0 && task.Steps[in.StepIndex-1].Status != StepSucceeded {
+				return classified(ErrCodeConflict, "cannot succeed step %d before predecessor", in.StepIndex)
+			}
+			step.Status = StepSucceeded
+		} else {
+			step.Status = StepFailed
+		}
+		step.LastDetail = in.Detail
+		t := now
+		step.UpdatedAt = &t
+		tx.PutCompaction(*task)
+		cp := *step
+		out = &cp
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TakeoverCompactionLease 接管有效压缩任务的执行租约：epoch 单调递增并换发租约 ID，
+// 在途步骤重置为可重试；旧租约持有者的回执因 epoch 不匹配被拒绝。
+func (s *Service) TakeoverCompactionLease(ctx context.Context, taskID, newHolder, reason string) (*CompactionTask, error) {
+	if newHolder == "" {
+		return nil, classified(ErrCodeInvalidArgument, "new holder is required")
+	}
+	var out *CompactionTask
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", taskID)
+		}
+		if !task.Active() {
+			return classified(ErrCodeConflict, "cannot take over lease of %s compaction %s", task.Status, task.ID)
+		}
+		now := s.timeNow()
+		task.LeaseID = tx.NewID("lease")
+		task.LeaseEpoch = task.LeaseEpoch + 1
+		task.LeaseHolder = newHolder
+		for i := range task.Steps {
+			step := &task.Steps[i]
+			if step.Status == StepRunning {
+				step.Status = StepFailed
+				step.ExecutionVersion++
+				step.LastDetail = "reset by lease takeover"
+				t := now
+				step.UpdatedAt = &t
+			}
+		}
+		tx.PutCompaction(*task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: task.LeaseID, Epoch: task.LeaseEpoch,
+			Holder: newHolder, Action: LeaseTakenOver,
+			Reason: reason,
+		})
+		out = cloneCompactionTask(task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// PublishCompactionInput 发布压缩结果的入参。
+// ContentDigest 是执行方对合并产物计算的内容摘要，必须等于任务冻结的 ExpectedDigest。
+type PublishCompactionInput struct {
+	TaskID        string
+	LeaseID       string
+	Epoch         int64
+	ContentDigest string
+}
+
+// PublishCompactionResult 返回终态任务、新完整快照与全部替代关系。
+type PublishCompactionResult struct {
+	Task         *CompactionTask
+	NewSnapshot  *Snapshot
+	Replacements []Replacement
+}
+
+// PublishCompaction 在单个事务内原子发布压缩结果：
+//  1. 校验租约与全部步骤成功；
+//  2. 校验内容摘要与冻结的期望摘要一致，不通过则任务保持可重试、读者仍看到原链；
+//  3. 校验冻结链上没有任何快照已被其他压缩替代（同一链最多一个有效结果）；
+//  4. 一次性写入：新的已完成完整快照 + 每个原快照的替代关系 + 任务终态。
+//
+// 新快照在此事务提交前不存在，读者不可能观察到半成品；对已成功任务重复调用幂等。
+func (s *Service) PublishCompaction(ctx context.Context, in PublishCompactionInput) (*PublishCompactionResult, error) {
+	if in.ContentDigest == "" {
+		return nil, classified(ErrCodeInvalidArgument, "content digest is required")
+	}
+	res := &PublishCompactionResult{}
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetCompaction(in.TaskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "compaction task %s not found", in.TaskID)
+		}
+		if !task.Active() {
+			// 幂等：已发布的任务返回既有结果，不产生第二个快照。
+			snap, ok := tx.GetSnapshot(task.NewSnapshotID)
+			if !ok {
+				return classified(ErrCodeConflict, "compaction %s is %s but result snapshot %s is missing",
+					task.ID, task.Status, task.NewSnapshotID)
+			}
+			res.Task = cloneCompactionTask(task)
+			res.NewSnapshot = cloneSnapshot(snap)
+			for _, f := range task.Chain {
+				if r, ok := tx.GetReplacement(f.SnapshotID); ok {
+					res.Replacements = append(res.Replacements, *r)
+				}
+			}
+			return nil
+		}
+		if err := requireCompactionLease(task, in.LeaseID, in.Epoch); err != nil {
+			return err
+		}
+		for _, step := range task.Steps {
+			if step.Status != StepSucceeded {
+				return classified(ErrCodeConflict, "compaction %s step %d is %s, cannot publish",
+					task.ID, step.Index, step.Status)
+			}
+		}
+		if in.ContentDigest != task.ExpectedDigest {
+			return classified(ErrCodeConflict,
+				"content digest mismatch for compaction %s: expected %s, got %s",
+				task.ID, task.ExpectedDigest, in.ContentDigest)
+		}
+		for _, ex := range tx.ListSnapshots() {
+			if ex.Digest == in.ContentDigest {
+				return classified(ErrCodeAlreadyExists, "snapshot with digest %s already exists: %s",
+					in.ContentDigest, ex.ID)
+			}
+		}
+		// 同一链的并发压缩：任何节点已被替代则本任务失败，赢家只有一个。
+		for _, f := range task.Chain {
+			snap, ok := tx.GetSnapshot(f.SnapshotID)
+			if !ok {
+				return classified(ErrCodeConflict, "chain snapshot %s no longer exists", f.SnapshotID)
+			}
+			if snap.Digest != f.Digest {
+				return classified(ErrCodeConflict, "chain snapshot %s digest changed since freeze", f.SnapshotID)
+			}
+			if r, replaced := tx.GetReplacement(f.SnapshotID); replaced {
+				return classified(ErrCodeConflict,
+					"chain snapshot %s already replaced by compaction %s", f.SnapshotID, r.CompactionTaskID)
+			}
+		}
+
+		now := s.timeNow()
+		newSnap := Snapshot{
+			ID:          tx.NewID("snap"),
+			DatasetID:   task.DatasetID,
+			Kind:        KindFull,
+			Digest:      in.ContentDigest,
+			Status:      StatusCompleted,
+			CreatedAt:   now,
+			CompletedAt: &now,
+		}
+		tx.PutSnapshot(newSnap)
+		tx.BumpDatasetVersion(task.DatasetID)
+		for _, f := range task.Chain {
+			rep := Replacement{
+				OriginalSnapshotID: f.SnapshotID,
+				NewSnapshotID:      newSnap.ID,
+				CompactionTaskID:   task.ID,
+				DatasetID:          task.DatasetID,
+				PublishedAt:        now,
+			}
+			if err := tx.PutReplacement(rep); err != nil {
+				return err
+			}
+			res.Replacements = append(res.Replacements, rep)
+		}
+		task.Status = TaskSucceeded
+		task.NewSnapshotID = newSnap.ID
+		task.CompletedAt = &now
+		tx.PutCompaction(*task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: task.LeaseID, Epoch: task.LeaseEpoch,
+			Holder: task.LeaseHolder, Action: LeaseReleased, Reason: "compaction published",
+		})
+		res.Task = cloneCompactionTask(task)
+		res.NewSnapshot = cloneSnapshot(&newSnap)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// ListReplacements 列出替代关系（原快照 -> 新完整快照）；datasetID 为空时返回全部。
+func (s *Service) ListReplacements(ctx context.Context, datasetID string) ([]Replacement, error) {
+	var out []Replacement
+	err := s.store.View(func(tx *Tx) error {
+		for _, r := range tx.ListReplacements() {
+			if datasetID == "" || r.DatasetID == datasetID {
+				out = append(out, *r)
+			}
+		}
+		return nil
+	})
+	return out, err
+}
+
+// GetEffectiveChain 返回目标快照的“新链”视图：在原始回溯链上应用已发布的
+// 压缩替代（可链式：被替代的完整快照自身也可能被更新的压缩替代）。
+// 未发布任何相关压缩时与 GetBackupChain 一致。
+func (s *Service) GetEffectiveChain(ctx context.Context, targetSnapshotID string) ([]*Snapshot, error) {
+	var out []*Snapshot
+	err := s.store.View(func(tx *Tx) error {
+		if _, ok := tx.GetSnapshot(targetSnapshotID); !ok {
+			return classified(ErrCodeNotFound, "snapshot %s not found", targetSnapshotID)
+		}
+		chain, err := walkChain(tx, targetSnapshotID)
+		if err != nil {
+			return err
+		}
+		// 反复应用替代段，直到没有可应用的压缩；每次应用都缩短链，保证终止。
+		for {
+			applied := false
+			for i, sn := range chain {
+				rep, ok := tx.GetReplacement(sn.ID)
+				if !ok {
+					continue
+				}
+				task, ok := tx.GetCompaction(rep.CompactionTaskID)
+				if !ok {
+					continue
+				}
+				seg := task.Chain
+				if i+len(seg) > len(chain) {
+					continue
+				}
+				match := true
+				for j, f := range seg {
+					if chain[i+j].ID != f.SnapshotID {
+						match = false
+						break
+					}
+				}
+				if !match {
+					continue
+				}
+				newSnap, ok := tx.GetSnapshot(rep.NewSnapshotID)
+				if !ok {
+					continue
+				}
+				next := make([]*Snapshot, 0, len(chain)-len(seg)+1)
+				next = append(next, chain[:i]...)
+				next = append(next, newSnap)
+				next = append(next, chain[i+len(seg):]...)
+				chain = next
+				applied = true
+				break
+			}
+			if !applied {
+				break
+			}
+		}
+		for _, sn := range chain {
+			out = append(out, cloneSnapshot(sn))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ReferenceBlock 是一条阻止快照被回收的引用。
+type ReferenceBlock struct {
+	Kind   string // restore_task | compaction_task | child_snapshot
+	ID     string // 引用方 ID（任务 ID 或子快照 ID）
+	Detail string
+}
+
+// SnapshotReferences 解释一个快照当前被谁引用、以及（若已发布压缩）被谁替代。
+type SnapshotReferences struct {
+	SnapshotID string
+	Blocks     []ReferenceBlock
+	ReplacedBy *Replacement
+}
+
+// ExplainSnapshotReferences 汇总快照的引用阻断原因，用于排查“为什么还没被清理”。
+func (s *Service) ExplainSnapshotReferences(ctx context.Context, snapshotID string) (*SnapshotReferences, error) {
+	var out *SnapshotReferences
+	err := s.store.View(func(tx *Tx) error {
+		snap, ok := tx.GetSnapshot(snapshotID)
+		if !ok {
+			return classified(ErrCodeNotFound, "snapshot %s not found", snapshotID)
+		}
+		res := &SnapshotReferences{SnapshotID: snapshotID}
+		for _, task := range tx.ListTasks() {
+			if !task.Active() {
+				continue
+			}
+			for _, f := range task.Chain {
+				if f.SnapshotID == snapshotID {
+					res.Blocks = append(res.Blocks, ReferenceBlock{
+						Kind: "restore_task", ID: task.ID,
+						Detail: fmt.Sprintf("frozen by active restore to %s", task.TargetEnvironment),
+					})
+					break
+				}
+			}
+		}
+		for _, c := range tx.ListCompactions() {
+			if !c.Active() {
+				continue
+			}
+			for _, f := range c.Chain {
+				if f.SnapshotID == snapshotID {
+					res.Blocks = append(res.Blocks, ReferenceBlock{
+						Kind: "compaction_task", ID: c.ID,
+						Detail: fmt.Sprintf("frozen by active compaction %s -> %s", c.FromSnapshotID, c.ToSnapshotID),
+					})
+					break
+				}
+			}
+		}
+		for _, child := range tx.ListChildren(snapshotID) {
+			if child.Status == StatusFailed {
+				continue
+			}
+			res.Blocks = append(res.Blocks, ReferenceBlock{
+				Kind: "child_snapshot", ID: child.ID,
+				Detail: fmt.Sprintf("referenced by %s snapshot (status=%s)", child.Kind, child.Status),
+			})
+		}
+		if rep, ok := tx.GetReplacement(snap.ID); ok {
+			cp := *rep
+			res.ReplacedBy = &cp
+		}
+		out = res
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

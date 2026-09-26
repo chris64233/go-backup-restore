@@ -133,6 +133,42 @@ type OutboxEvent struct {
 
 const OutboxRestoreCompleted = "restore_completed"
 
+// CompactionTask 是一次链压缩：把一段已完成、连续的快照链合成为新的完整快照。
+// 创建时冻结起点、终点、链上每个快照的摘要以及数据集版本，此后执行针对的
+// 永远是这份冻结视图。执行租约按 epoch 递增接管，语义与恢复任务一致：
+// 旧租约持有者的回执不能推进新接管者的任务。
+type CompactionTask struct {
+	ID             string
+	IdempotencyKey string // 任务号：相同键重复创建返回同一任务，保证幂等
+	DatasetID      string
+	FromSnapshotID string // 起点，必须为完整快照（链根）
+	ToSnapshotID   string // 终点
+	Chain          []FrozenSnapshot
+	DatasetVersion int64  // 创建时冻结的数据集版本（每次登记/发布递增）
+	ExpectedDigest string // 由冻结链推导的内容摘要，发布前必须校验通过
+	Steps          []RestoreStep
+	Status         TaskStatus
+	LeaseID        string
+	LeaseEpoch     int64
+	LeaseHolder    string
+	NewSnapshotID  string // 发布成功后指向新的完整快照
+	CreatedAt      time.Time
+	StartedAt      *time.Time
+	CompletedAt    *time.Time
+}
+
+// Active 表示压缩任务是否仍冻结其链并占用执行租约。
+func (t CompactionTask) Active() bool { return t.Status.active() }
+
+// Replacement 记录一个原快照被哪个新完整快照替代（发布时写入，永不修改）。
+type Replacement struct {
+	OriginalSnapshotID string
+	NewSnapshotID      string
+	CompactionTaskID   string
+	DatasetID          string
+	PublishedAt        time.Time
+}
+
 // RetentionRule 表达按数据集保留最近 N 个已完成快照的策略。
 // KeepLatestCompleted <= 0 表示不按数量保护任何快照。
 type RetentionRule struct {
@@ -150,14 +186,16 @@ const (
 
 // 保留/删除原因码，写入决策记录，解释每个决定的依据。
 const (
-	ReasonActiveRestore       = "active_restore"
-	ReasonRetentionPolicy     = "retention_policy"
-	ReasonIncompleteSnapshot  = "incomplete_snapshot"
-	ReasonAncestorIncomplete  = "ancestor_of_incomplete_snapshot"
-	ReasonAncestorRetained    = "ancestor_of_retained_snapshot"
-	ReasonSnapshotInProgress  = "snapshot_in_progress"
-	ReasonExpiredUnreferenced = "expired_and_unreferenced"
-	ReasonFailedUnreferenced  = "failed_and_unreferenced"
+	ReasonActiveRestore        = "active_restore"
+	ReasonActiveCompaction     = "active_compaction"
+	ReasonRetentionPolicy      = "retention_policy"
+	ReasonIncompleteSnapshot   = "incomplete_snapshot"
+	ReasonAncestorIncomplete   = "ancestor_of_incomplete_snapshot"
+	ReasonAncestorRetained     = "ancestor_of_retained_snapshot"
+	ReasonSnapshotInProgress   = "snapshot_in_progress"
+	ReasonExpiredUnreferenced  = "expired_and_unreferenced"
+	ReasonFailedUnreferenced   = "failed_and_unreferenced"
+	ReasonReplacedByCompaction = "replaced_by_compaction"
 )
 
 // RetentionDecision 是一次保留运行中对单个快照的决定与原因。
