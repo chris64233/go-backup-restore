@@ -14,30 +14,32 @@ import (
 // 提交成功后整体替换，因此每个事务都工作在一个可序列化的一致快照上：
 // 保留清理看到的引用关系，绝不会是快照登记/恢复创建执行到一半的中间状态。
 type state struct {
-	Snapshots       map[string]*Snapshot       `json:"snapshots"`
-	Tasks           map[string]*RestoreTask    `json:"tasks"`
-	Compactions     map[string]*CompactionTask `json:"compactions"`
-	CompactionByKey map[string]string          `json:"compaction_by_key"`
-	Replacements    map[string]*Replacement    `json:"replacements"`
-	DatasetVersions map[string]int64           `json:"dataset_versions"`
-	Outbox          map[string]*OutboxEvent    `json:"outbox"`
-	OutboxByTask    map[string]string          `json:"outbox_by_task"`
-	LeaseEvents     []LeaseEvent               `json:"lease_events"`
-	RetentionRuns   []*RetentionRun            `json:"retention_runs"`
-	IDSeq           map[string]int64           `json:"id_seq"`
+	Snapshots         map[string]*Snapshot       `json:"snapshots"`
+	ArchivedSnapshots map[string]*Snapshot       `json:"archived_snapshots"`
+	Tasks             map[string]*RestoreTask    `json:"tasks"`
+	Compactions       map[string]*CompactionTask `json:"compactions"`
+	CompactionByKey   map[string]string          `json:"compaction_by_key"`
+	Replacements      map[string]*Replacement    `json:"replacements"`
+	DatasetVersions   map[string]int64           `json:"dataset_versions"`
+	Outbox            map[string]*OutboxEvent    `json:"outbox"`
+	OutboxByTask      map[string]string          `json:"outbox_by_task"`
+	LeaseEvents       []LeaseEvent               `json:"lease_events"`
+	RetentionRuns     []*RetentionRun            `json:"retention_runs"`
+	IDSeq             map[string]int64           `json:"id_seq"`
 }
 
 func newState() *state {
 	return &state{
-		Snapshots:       map[string]*Snapshot{},
-		Tasks:           map[string]*RestoreTask{},
-		Compactions:     map[string]*CompactionTask{},
-		CompactionByKey: map[string]string{},
-		Replacements:    map[string]*Replacement{},
-		DatasetVersions: map[string]int64{},
-		Outbox:          map[string]*OutboxEvent{},
-		OutboxByTask:    map[string]string{},
-		IDSeq:           map[string]int64{},
+		Snapshots:         map[string]*Snapshot{},
+		ArchivedSnapshots: map[string]*Snapshot{},
+		Tasks:             map[string]*RestoreTask{},
+		Compactions:       map[string]*CompactionTask{},
+		CompactionByKey:   map[string]string{},
+		Replacements:      map[string]*Replacement{},
+		DatasetVersions:   map[string]int64{},
+		Outbox:            map[string]*OutboxEvent{},
+		OutboxByTask:      map[string]string{},
+		IDSeq:             map[string]int64{},
 	}
 }
 
@@ -46,6 +48,9 @@ func (s *state) normalize() {
 	fresh := newState()
 	if s.Snapshots == nil {
 		s.Snapshots = fresh.Snapshots
+	}
+	if s.ArchivedSnapshots == nil {
+		s.ArchivedSnapshots = fresh.ArchivedSnapshots
 	}
 	if s.Tasks == nil {
 		s.Tasks = fresh.Tasks
@@ -71,12 +76,34 @@ func (s *state) normalize() {
 	if s.IDSeq == nil {
 		s.IDSeq = fresh.IDSeq
 	}
+	// 兼容旧版本状态文件：FailureStepIndex 缺失时为零值 0，只有该索引步骤
+	// 确实处于 failed 才表示失败位置，否则重置为 -1（无失败）。
+	for _, t := range s.Tasks {
+		if t.FailureStepIndex == 0 {
+			if len(t.Steps) == 0 || t.Steps[0].Status != StepFailed {
+				t.FailureStepIndex = -1
+			}
+		}
+		// 旧任务没有独立逻辑链：物理链即逻辑链，来源标注补为自身。
+		if t.LogicalChain == nil && t.Chain != nil {
+			t.LogicalChain = make([]FrozenSnapshot, len(t.Chain))
+			for i, f := range t.Chain {
+				if f.OriginSnapshotID == "" {
+					f.OriginSnapshotID = f.SnapshotID
+				}
+				t.LogicalChain[i] = f
+			}
+		}
+	}
 }
 
 func (s *state) clone() *state {
 	c := newState()
 	for k, v := range s.Snapshots {
 		c.Snapshots[k] = cloneSnapshot(v)
+	}
+	for k, v := range s.ArchivedSnapshots {
+		c.ArchivedSnapshots[k] = cloneSnapshot(v)
 	}
 	for k, v := range s.Tasks {
 		c.Tasks[k] = cloneTask(v)
@@ -129,6 +156,7 @@ func cloneTask(t *RestoreTask) *RestoreTask {
 	}
 	c := *t
 	c.Chain = append([]FrozenSnapshot(nil), t.Chain...)
+	c.LogicalChain = append([]FrozenSnapshot(nil), t.LogicalChain...)
 	c.Steps = make([]RestoreStep, len(t.Steps))
 	for i, st := range t.Steps {
 		cs := st
@@ -149,6 +177,10 @@ func cloneTask(t *RestoreTask) *RestoreTask {
 	if t.CompletedAt != nil {
 		tt := *t.CompletedAt
 		c.CompletedAt = &tt
+	}
+	if t.CancelledAt != nil {
+		tt := *t.CancelledAt
+		c.CancelledAt = &tt
 	}
 	return &c
 }
@@ -209,6 +241,41 @@ type Tx struct {
 func (tx *Tx) GetSnapshot(id string) (*Snapshot, bool) {
 	s, ok := tx.st.Snapshots[id]
 	return s, ok
+}
+
+// GetSnapshotAny 在活跃表与归档表中查找快照。归档记录的实体已被保留清理
+// 回收，只能用于按时间点恢复的计划解析（时间戳/摘要等不可变元数据），
+// 不能再登记子快照或直接恢复。
+func (tx *Tx) GetSnapshotAny(id string) (*Snapshot, bool) {
+	if s, ok := tx.st.Snapshots[id]; ok {
+		return s, true
+	}
+	s, ok := tx.st.ArchivedSnapshots[id]
+	return s, ok
+}
+
+// ListSnapshotsByDatasetAny 列出数据集的全部快照（含已回收归档），按创建时间排序。
+func (tx *Tx) ListSnapshotsByDatasetAny(datasetID string) []*Snapshot {
+	out := make([]*Snapshot, 0)
+	seen := map[string]bool{}
+	for _, s := range sortedSnapshots(tx.st.Snapshots) {
+		if s.DatasetID == datasetID {
+			out = append(out, s)
+			seen[s.ID] = true
+		}
+	}
+	for _, s := range sortedSnapshots(tx.st.ArchivedSnapshots) {
+		if s.DatasetID == datasetID && !seen[s.ID] {
+			out = append(out, s)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 func sortedSnapshots(in map[string]*Snapshot) []*Snapshot {
@@ -334,6 +401,18 @@ func (tx *Tx) ListReplacements() []*Replacement {
 	return out
 }
 
+// IsCompactionProduct 判断快照是否为某次链压缩发布产生的替代完整快照。
+// 压缩产物在内容上等价于被压缩段的段尾（发布时摘要校验），不构成新的逻辑
+// 恢复时间点，因此按时间点选择目标时将其排除。
+func (tx *Tx) IsCompactionProduct(snapshotID string) bool {
+	for _, r := range tx.st.Replacements {
+		if r.NewSnapshotID == snapshotID {
+			return true
+		}
+	}
+	return false
+}
+
 // DatasetVersion 返回数据集当前版本（每次登记快照或发布压缩结果递增）。
 func (tx *Tx) DatasetVersion(datasetID string) int64 {
 	return tx.st.DatasetVersions[datasetID]
@@ -397,7 +476,13 @@ func (tx *Tx) ListRetentionRuns() []*RetentionRun {
 
 func (tx *Tx) PutSnapshot(s Snapshot) { tx.st.Snapshots[s.ID] = &s }
 
+// DeleteSnapshot 把快照移出活跃表并归档其不可变记录。物理实体由调用方负责
+// 回收；归档行只保留按时间点恢复计划解析所需的元数据（ID/父边/摘要/时间戳），
+// 不出现在任何常规查询中。
 func (tx *Tx) DeleteSnapshot(id string) {
+	if s, ok := tx.st.Snapshots[id]; ok {
+		tx.st.ArchivedSnapshots[id] = cloneSnapshot(s)
+	}
 	delete(tx.st.Snapshots, id)
 }
 

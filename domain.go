@@ -38,24 +38,36 @@ type Snapshot struct {
 
 // FrozenSnapshot 是恢复任务创建时冻结下来的链节点。
 // 即使后续保留清理运行，活动恢复引用的快照也不允许被删除。
+//
+// 按时间点恢复时，计划可能引用压缩产生的替代完整快照：此时 SnapshotID 是
+// 实际要读取的物理快照，OriginSnapshotID 是计划时刻逻辑链上被替代段的末端
+// 节点，ViaCompactionTaskID 记录引入该替代的压缩任务；直接节点两者为空/自身。
 type FrozenSnapshot struct {
-	Index      int
-	SnapshotID string
-	Digest     string
-	Kind       SnapshotKind
+	Index               int
+	SnapshotID          string
+	Digest              string
+	Kind                SnapshotKind
+	OriginSnapshotID    string // 逻辑链节点；与 SnapshotID 相同表示直接引用
+	ViaCompactionTaskID string // 非空表示该节点来自压缩替代
 }
 
-// TaskStatus 恢复任务状态机：pending -> running -> succeeded。
-// 失败的步骤允许重试，因此任务没有 failed 终态。
+// TaskStatus 恢复任务状态机：pending -> running -> succeeded | cancelled。
+// 失败的步骤允许重试，因此执行中没有 failed 终态；任务只能由取消进入 cancelled，
+// cancelled 是终态，与执行并发时谁先进入事务谁生效，全局只留下一个状态。
 type TaskStatus string
 
 const (
 	TaskPending   TaskStatus = "pending"
 	TaskRunning   TaskStatus = "running"
 	TaskSucceeded TaskStatus = "succeeded"
+	TaskCancelled TaskStatus = "cancelled"
 )
 
+// active 表示任务仍占用目标环境与冻结链。cancelled 与 succeeded 都是终态。
 func (t TaskStatus) active() bool { return t == TaskPending || t == TaskRunning }
+
+// terminal 表示任务已进入终态（成功或取消）。
+func (t TaskStatus) terminal() bool { return t == TaskSucceeded || t == TaskCancelled }
 
 // StepStatus 单个恢复步骤的状态。
 type StepStatus string
@@ -83,20 +95,38 @@ type RestoreStep struct {
 }
 
 // RestoreTask 是一次恢复：链在创建时冻结，租约按 epoch 递增接管。
+//
+// 两种创建方式：
+//   - 指定 TargetSnapshotID：恢复某个快照本身，TargetTime 为空，
+//     Chain 即该快照回溯到根的物理链，LogicalChain 与 Chain 同源；
+//   - 按时间点恢复（TargetTime 非空）：TargetSnapshotID 是选出的逻辑目标
+//     （CreatedAt <= TargetTime 的最近已完成快照），LogicalChain 记录当时的
+//     逻辑链（full -> 目标），Chain 是应用压缩替代后实际要执行的物理计划。
+//     两者都在创建事务内冻结，此后链压缩发布或保留回收都不改变本任务的计划。
 type RestoreTask struct {
 	ID                string
 	DatasetID         string
 	TargetEnvironment string
 	TargetSnapshotID  string
+	TargetTime        *time.Time // 非空表示按时间点恢复
+	LogicalChain      []FrozenSnapshot
 	Chain             []FrozenSnapshot
 	Steps             []RestoreStep
 	Status            TaskStatus
 	LeaseID           string
 	LeaseEpoch        int64
 	LeaseHolder       string
-	CreatedAt         time.Time
-	StartedAt         *time.Time
-	CompletedAt       *time.Time
+	// FailureStepIndex/FailureDetail 指向最近一次失败回执的步骤位置与详情，
+	// 是“失败位置”查询的依据；步骤重试后清空，随每步状态一起持久化，
+	// 进程重启后仍可定位中断点。-1 表示当前没有失败步骤。
+	FailureStepIndex int
+	FailureDetail    string
+	CreatedAt        time.Time
+	StartedAt        *time.Time
+	CompletedAt      *time.Time
+	CancelledAt      *time.Time
+	CancelReason     string
+	CancelledBy      string
 }
 
 // Active 表示任务是否仍占用目标环境与链上快照。
@@ -109,7 +139,7 @@ type LeaseEvent struct {
 	LeaseID string
 	Epoch   int64
 	Holder  string
-	Action  string // acquired | taken_over | released
+	Action  string // acquired | taken_over | released | cancelled
 	Reason  string
 }
 
@@ -117,6 +147,7 @@ const (
 	LeaseAcquired  = "acquired"
 	LeaseTakenOver = "taken_over"
 	LeaseReleased  = "released"
+	LeaseCancelled = "cancelled"
 )
 
 // OutboxEvent 是任务完成时写出的通知。同一任务只会写出一条。

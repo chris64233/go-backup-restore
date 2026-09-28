@@ -249,54 +249,119 @@ func (s *Service) GetBackupChain(ctx context.Context, targetSnapshotID string) (
 // 恢复创建：冻结链 + 租约
 // ---------------------------------------------------------------------------
 
-// CreateRestoreInput 创建恢复任务的入参。
+// CreateRestoreInput 创建恢复任务的入参，两种互斥的目标指定方式：
+//   - 快照恢复：提供 TargetSnapshotID，恢复某个确定的快照本身；
+//   - 按时间点恢复：提供 DatasetID 与非零 TargetTime，由系统在
+//     CreatedAt <= TargetTime 的已完成快照中选择最近的一个作为逻辑目标，
+//     并把压缩替代解析进物理执行计划。
 type CreateRestoreInput struct {
-	TargetSnapshotID  string
+	// 快照恢复（与 DatasetID/TargetTime 二选一）。
+	TargetSnapshotID string
+	// 按时间点恢复。
+	DatasetID  string
+	TargetTime time.Time
+
 	TargetEnvironment string
 	Holder            string // 申请租约的执行方标识
 }
 
 // CreateRestore 在单个事务内：
-//  1. 校验目标快照已完成（失败/进行中均不可恢复），并回溯构造到完整快照的链；
-//  2. 冻结链（此后保留清理不得删除链上任何快照）；
-//  3. 取得目标环境的恢复租约（同一环境同时只允许一个有效恢复）。
+//  1. 确定恢复目标：显式快照，或目标时间之前最近的已完成快照；
+//  2. 构造恢复计划：快照模式回溯原始父链；时间点模式在原始链上应用
+//     已发布的压缩替代（原链节点即使已被保留清理回收也能折叠到替代完整快照），
+//     同时冻结逻辑链与物理执行链；
+//  3. 冻结计划（此后并发的链压缩不能更换计划，保留清理不得删除物理链上的快照）；
+//  4. 取得目标环境的恢复租约（同一环境同时只允许一个有效恢复）。
 func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*RestoreTask, error) {
-	if in.TargetSnapshotID == "" || in.TargetEnvironment == "" || in.Holder == "" {
-		return nil, classified(ErrCodeInvalidArgument, "target snapshot id, target environment and holder are required")
+	if in.TargetEnvironment == "" || in.Holder == "" {
+		return nil, classified(ErrCodeInvalidArgument, "target environment and holder are required")
+	}
+	snapshotMode := in.TargetSnapshotID != ""
+	pitMode := in.DatasetID != "" || !in.TargetTime.IsZero()
+	if snapshotMode == pitMode {
+		return nil, classified(ErrCodeInvalidArgument,
+			"exactly one of target snapshot id or (dataset id + target time) is required")
+	}
+	if pitMode && in.DatasetID == "" {
+		return nil, classified(ErrCodeInvalidArgument, "dataset id is required for point-in-time restore")
 	}
 	var out *RestoreTask
 	err := s.store.Update(func(tx *Tx) error {
-		target, ok := tx.GetSnapshot(in.TargetSnapshotID)
-		if !ok {
-			return classified(ErrCodeNotFound, "target snapshot %s not found", in.TargetSnapshotID)
-		}
-		switch target.Status {
-		case StatusFailed:
-			return classified(ErrCodeConflict, "cannot restore from failed snapshot %s", target.ID)
-		case StatusPending:
-			return classified(ErrCodeConflict, "snapshot %s is not completed yet", target.ID)
-		}
-		chainSnap, err := walkChain(tx, target.ID)
-		if err != nil {
-			return err
-		}
-		for _, sn := range chainSnap {
-			if sn.Status != StatusCompleted {
-				return classified(ErrCodeConflict, "snapshot %s on chain is %s, only completed chains can be restored",
-					sn.ID, sn.Status)
+		var target *Snapshot
+		var logical, physical []FrozenSnapshot
+
+		if pitMode {
+			// 时间点选择：在数据集全部已完成快照（含已被保留清理归档的）中，
+			// 取 CreatedAt <= 目标时间的最近一个；同一时刻以更大的 ID 决胜
+			//（登记顺序更晚），结果对并发确定。
+			targetTime := in.TargetTime.UTC()
+			for _, sn := range tx.ListSnapshotsByDatasetAny(in.DatasetID) {
+				if sn.Status != StatusCompleted || sn.CreatedAt.After(targetTime) {
+					continue
+				}
+				// 压缩产物不是新的逻辑时间点（内容等价于段尾，段尾本身仍可被选中）。
+				if tx.IsCompactionProduct(sn.ID) {
+					continue
+				}
+				if target == nil || sn.CreatedAt.After(target.CreatedAt) ||
+					(sn.CreatedAt.Equal(target.CreatedAt) && sn.ID > target.ID) {
+					target = sn
+				}
+			}
+			if target == nil {
+				return classified(ErrCodeNotFound,
+					"no completed snapshot in dataset %s at or before %s", in.DatasetID, targetTime.Format(time.RFC3339Nano))
+			}
+			var err error
+			logical, physical, err = resolvePointInTimePlan(tx, target, targetTime)
+			if err != nil {
+				return err
+			}
+		} else {
+			var ok bool
+			target, ok = tx.GetSnapshot(in.TargetSnapshotID)
+			if !ok {
+				return classified(ErrCodeNotFound, "target snapshot %s not found", in.TargetSnapshotID)
+			}
+			switch target.Status {
+			case StatusFailed:
+				return classified(ErrCodeConflict, "cannot restore from failed snapshot %s", target.ID)
+			case StatusPending:
+				return classified(ErrCodeConflict, "snapshot %s is not completed yet", target.ID)
+			}
+			chainSnap, err := walkChain(tx, target.ID)
+			if err != nil {
+				return err
+			}
+			for _, sn := range chainSnap {
+				if sn.Status != StatusCompleted {
+					return classified(ErrCodeConflict, "snapshot %s on chain is %s, only completed chains can be restored",
+						sn.ID, sn.Status)
+				}
+			}
+			logical = make([]FrozenSnapshot, len(chainSnap))
+			physical = make([]FrozenSnapshot, len(chainSnap))
+			for i, sn := range chainSnap {
+				f := FrozenSnapshot{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Kind: sn.Kind, OriginSnapshotID: sn.ID}
+				logical[i] = f
+				physical[i] = f
 			}
 		}
+
 		if existing, ok := tx.FindActiveTaskByEnv(in.TargetEnvironment); ok {
 			return classified(ErrCodeConflict, "target environment %s already has active restore %s (lease %s epoch %d)",
 				in.TargetEnvironment, existing.ID, existing.LeaseID, existing.LeaseEpoch)
 		}
 
 		now := s.timeNow()
-		frozen := make([]FrozenSnapshot, len(chainSnap))
-		steps := make([]RestoreStep, len(chainSnap))
-		for i, sn := range chainSnap {
-			frozen[i] = FrozenSnapshot{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Kind: sn.Kind}
-			steps[i] = RestoreStep{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Status: StepPending}
+		steps := make([]RestoreStep, len(physical))
+		for i, f := range physical {
+			steps[i] = RestoreStep{Index: i, SnapshotID: f.SnapshotID, Digest: f.Digest, Status: StepPending}
+		}
+		var targetTime *time.Time
+		if pitMode {
+			t := in.TargetTime.UTC()
+			targetTime = &t
 		}
 		leaseID := tx.NewID("lease")
 		task := RestoreTask{
@@ -304,12 +369,15 @@ func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*Re
 			DatasetID:         target.DatasetID,
 			TargetEnvironment: in.TargetEnvironment,
 			TargetSnapshotID:  target.ID,
-			Chain:             frozen,
+			TargetTime:        targetTime,
+			LogicalChain:      logical,
+			Chain:             physical,
 			Steps:             steps,
 			Status:            TaskPending,
 			LeaseID:           leaseID,
 			LeaseEpoch:        1,
 			LeaseHolder:       in.Holder,
+			FailureStepIndex:  -1,
 			CreatedAt:         now,
 		}
 		tx.PutTask(task)
@@ -324,6 +392,161 @@ func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*Re
 		return nil, err
 	}
 	return out, nil
+}
+
+// resolvePointInTimePlan 从逻辑目标快照出发构造时间点恢复计划，
+// 返回“根 -> 目标”顺序的：
+//   - 逻辑链 logical：选择时刻看到的链（原始完整快照 + 增量）。
+//     已被保留清理回收的节点仍可从归档表与压缩任务冻结视图中复原其 ID/摘要/父边；
+//   - 物理执行链 physical：在逻辑链上反复应用已发布压缩的整段替代
+//     （与 GetEffectiveChain 同一套“冻结段精确匹配”规则，支持链式压缩），
+//     是实际要读取/应用的快照；物理节点必须仍然存在，否则计划失败而非断裂。
+//
+// 压缩产物在内容上等价于被压缩段（发布时 ExpectedDigest 校验），因此即使其
+// 发布时间晚于目标时间，用于恢复目标时刻也是等价的；计划一旦在本事务冻结，
+// 之后新的压缩发布或保留回收都不再影响它。
+func resolvePointInTimePlan(tx *Tx, target *Snapshot, targetTime time.Time) (logical, physical []FrozenSnapshot, err error) {
+	type node struct {
+		id, digest string
+		kind       SnapshotKind
+	}
+
+	// 1) 沿父边回溯构造逻辑链（root -> target），允许读取已归档（回收）记录。
+	rev := make([]node, 0)
+	curID := target.ID
+	datasetID := target.DatasetID
+	seen := map[string]bool{}
+	for {
+		if seen[curID] {
+			return nil, nil, classified(ErrCodeConflict, "cycle detected while resolving restore plan at %s", curID)
+		}
+		seen[curID] = true
+		cur, ok := tx.GetSnapshotAny(curID)
+		if !ok {
+			return nil, nil, classified(ErrCodeConflict,
+				"snapshot chain is broken: %s is missing without a compaction replacement", curID)
+		}
+		if cur.DatasetID != datasetID {
+			return nil, nil, classified(ErrCodeConflict, "snapshot %s belongs to another dataset", cur.ID)
+		}
+		if cur.Status != StatusCompleted {
+			return nil, nil, classified(ErrCodeConflict,
+				"snapshot %s on chain is %s, only completed chains can be restored", cur.ID, cur.Status)
+		}
+		rev = append(rev, node{cur.ID, cur.Digest, cur.Kind})
+		if cur.Kind == KindFull {
+			if cur.ParentID != "" {
+				return nil, nil, classified(ErrCodeConflict, "full snapshot %s must not have a parent", cur.ID)
+			}
+			break
+		}
+		if cur.ParentID == "" {
+			return nil, nil, classified(ErrCodeConflict, "incremental snapshot %s has no parent", cur.ID)
+		}
+		curID = cur.ParentID
+	}
+	logicalNodes := make([]node, len(rev))
+	for i, n := range rev {
+		logicalNodes[len(rev)-1-i] = n
+	}
+
+	// 2) 在逻辑链上反复折叠已发布压缩段，规则与 GetEffectiveChain 一致：
+	//    替代任务的冻结链必须与当前链的一个连续段逐 ID 精确匹配。
+	//    每折一次链严格变短，循环必然终止。
+	type physNode struct {
+		node
+		originTip string // 该物理节点覆盖到的逻辑链末端
+		viaTaskID string // 非空表示来自压缩替代
+	}
+	cur := make([]physNode, len(logicalNodes))
+	for i, n := range logicalNodes {
+		cur[i] = physNode{node: n, originTip: n.id}
+	}
+	for {
+		applied := false
+		for i := 0; i < len(cur); i++ {
+			rep, replaced := tx.GetReplacement(cur[i].id)
+			if !replaced {
+				continue
+			}
+			comp, ok := tx.GetCompaction(rep.CompactionTaskID)
+			if !ok {
+				return nil, nil, classified(ErrCodeConflict,
+					"compaction %s behind replacement of %s is missing", rep.CompactionTaskID, cur[i].id)
+			}
+			seg := comp.Chain
+			if i+len(seg) > len(cur) {
+				continue
+			}
+			match := true
+			for j, f := range seg {
+				if cur[i+j].id != f.SnapshotID {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			// 替代快照必须是仍可读取的物理实体（活跃表），且为同数据集已完成完整快照。
+			fullSnap, ok := tx.GetSnapshot(rep.NewSnapshotID)
+			if !ok {
+				return nil, nil, classified(ErrCodeConflict,
+					"replacement full snapshot %s (compaction %s) has been physically reclaimed",
+					rep.NewSnapshotID, comp.ID)
+			}
+			if fullSnap.Kind != KindFull || fullSnap.Status != StatusCompleted || fullSnap.DatasetID != datasetID {
+				return nil, nil, classified(ErrCodeConflict,
+					"replacement snapshot %s is not a completed full of dataset %s", fullSnap.ID, datasetID)
+			}
+			if fullSnap.Digest != comp.ExpectedDigest {
+				return nil, nil, classified(ErrCodeConflict,
+					"replacement snapshot %s digest does not match frozen compaction %s", fullSnap.ID, comp.ID)
+			}
+			next := make([]physNode, 0, len(cur)-len(seg)+1)
+			next = append(next, cur[:i]...)
+			next = append(next, physNode{
+				node:      node{fullSnap.ID, fullSnap.Digest, KindFull},
+				originTip: cur[i+len(seg)-1].originTip,
+				viaTaskID: comp.ID,
+			})
+			next = append(next, cur[i+len(seg):]...)
+			cur = next
+			applied = true
+			break
+		}
+		if !applied {
+			break
+		}
+	}
+
+	logical = make([]FrozenSnapshot, len(logicalNodes))
+	for i, n := range logicalNodes {
+		logical[i] = FrozenSnapshot{Index: i, SnapshotID: n.id, Digest: n.digest, Kind: n.kind, OriginSnapshotID: n.id}
+	}
+	physical = make([]FrozenSnapshot, len(cur))
+	for i, p := range cur {
+		physical[i] = FrozenSnapshot{
+			Index: i, SnapshotID: p.id, Digest: p.digest, Kind: p.kind,
+			OriginSnapshotID: p.originTip, ViaCompactionTaskID: p.viaTaskID,
+		}
+	}
+	// 3) 物理链上的每个节点必须仍是可读取的实体。目标时刻若落在已回收压缩段
+	//    的中间（只能由整段的替代完整快照表示段尾状态），属于超出可恢复窗口，
+	//    明确报冲突而不是生成断裂/语义错误的计划。
+	for _, p := range physical {
+		sn, ok := tx.GetSnapshot(p.SnapshotID)
+		if !ok {
+			return nil, nil, classified(ErrCodeConflict,
+				"physical snapshot %s for target %s has been reclaimed and no matching compaction covers the target point",
+				p.SnapshotID, target.ID)
+		}
+		if sn.Digest != p.Digest {
+			return nil, nil, classified(ErrCodeConflict,
+				"physical snapshot %s digest changed since plan resolution", p.SnapshotID)
+		}
+	}
+	return logical, physical, nil
 }
 
 // GetRestoreTask 查询恢复任务（含冻结链、步骤与当前租约）。
@@ -356,14 +579,15 @@ func (s *Service) ListRestoreTasks(ctx context.Context) ([]*RestoreTask, error) 
 }
 
 // requireLease 在事务内校验任务有效且租约 ID + epoch 完全匹配。
-// 旧租约持有者（含被接管后仍持有旧 epoch 的执行者）一律被挡下。
+// 旧租约持有者（含被接管后仍持有旧 epoch 的执行者、取消后拿着换发前租约的
+// 执行者）一律先得到 lease 错误；租约正确但任务已终态则报 conflict。
 func requireLease(task *RestoreTask, leaseID string, epoch int64) error {
-	if !task.Active() {
-		return classified(ErrCodeConflict, "restore task %s is %s", task.ID, task.Status)
-	}
 	if task.LeaseID != leaseID || task.LeaseEpoch != epoch {
 		return classified(ErrCodeLease, "lease mismatch for task %s: current=%s epoch=%d, got=%s epoch=%d",
 			task.ID, task.LeaseID, task.LeaseEpoch, leaseID, epoch)
+	}
+	if !task.Active() {
+		return classified(ErrCodeConflict, "restore task %s is %s", task.ID, task.Status)
 	}
 	return nil
 }
@@ -475,8 +699,15 @@ func (s *Service) AckStep(ctx context.Context, in AckStepInput) (*RestoreStep, e
 				return classified(ErrCodeConflict, "cannot succeed step %d before predecessor", in.StepIndex)
 			}
 			step.Status = StepSucceeded
+			// 越过失败位置后清除失败标记；后续步骤若再失败会重新记录。
+			if task.FailureStepIndex == in.StepIndex {
+				task.FailureStepIndex = -1
+				task.FailureDetail = ""
+			}
 		} else {
 			step.Status = StepFailed
+			task.FailureStepIndex = in.StepIndex
+			task.FailureDetail = in.Detail
 		}
 		step.LastDetail = in.Detail
 		t := now
@@ -484,6 +715,38 @@ func (s *Service) AckStep(ctx context.Context, in AckStepInput) (*RestoreStep, e
 		tx.PutTask(*task)
 		cp := *step
 		out = &cp
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// FailureLocation 描述恢复计划的失败位置，用于中断排查。
+type FailureLocation struct {
+	TaskID     string
+	Index      int // 失败步骤在物理执行链上的位置
+	SnapshotID string
+	Detail     string
+}
+
+// HasFailure 表示当前是否有失败在等重试。
+func (l FailureLocation) HasFailure() bool { return l.Index >= 0 }
+
+// GetFailureLocation 查询任务最近一次失败回执的位置；没有失败时 HasFailure 为 false。
+func (s *Service) GetFailureLocation(ctx context.Context, taskID string) (*FailureLocation, error) {
+	var out *FailureLocation
+	err := s.store.View(func(tx *Tx) error {
+		task, ok := tx.GetTask(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "restore task %s not found", taskID)
+		}
+		loc := &FailureLocation{TaskID: task.ID, Index: task.FailureStepIndex, Detail: task.FailureDetail}
+		if loc.HasFailure() && loc.Index < len(task.Steps) {
+			loc.SnapshotID = task.Steps[loc.Index].SnapshotID
+		}
+		out = loc
 		return nil
 	})
 	if err != nil {
@@ -508,6 +771,10 @@ func (s *Service) CompleteRestore(ctx context.Context, taskID, leaseID string, e
 			return classified(ErrCodeNotFound, "restore task %s not found", taskID)
 		}
 		if !task.Active() {
+			if task.Status == TaskCancelled {
+				// 取消与完成竞争：取消先生效，完成不能再翻转终态。
+				return classified(ErrCodeConflict, "restore task %s is cancelled", task.ID)
+			}
 			// 幂等：任务已完成，复用已有通知，绝不产生第二条。
 			event, _ := tx.GetOutboxByTask(task.ID)
 			res.Task = cloneTask(task)
@@ -580,6 +847,12 @@ func (s *Service) TakeoverLease(ctx context.Context, taskID, newHolder, reason s
 				step.LastDetail = "reset by lease takeover"
 				t := now
 				step.UpdatedAt = &t
+				// 接管意味着上一位持有者的在途尝试已中断：记录为失败位置，
+				// 进程重启/接管后可直接查询到从哪里继续。
+				if task.FailureStepIndex < 0 {
+					task.FailureStepIndex = i
+					task.FailureDetail = "reset by lease takeover"
+				}
 			}
 		}
 		tx.PutTask(*task)
@@ -597,7 +870,75 @@ func (s *Service) TakeoverLease(ctx context.Context, taskID, newHolder, reason s
 	return out, nil
 }
 
-// ListLeaseEvents 返回租约获取/接管/释放的审计记录；taskID 为空时返回全部。
+// CancelRestoreInput 取消恢复任务的入参。
+type CancelRestoreInput struct {
+	TaskID string
+	Reason string
+	By     string
+}
+
+// CancelRestore 请求取消一个仍在执行的恢复任务。取消与执行并发时只会留下
+// 一个状态：本操作在单个事务内把任务置为终态 cancelled，同时换发租约
+// （epoch + 1、租约 ID 更换），使正在派发/回执的执行者立刻被 fencing：
+//   - 取消先于执行落库：执行者后续的 DispatchNextStep/AckStep/CompleteRestore
+//     因租约不匹配或任务已终态被拒绝（lease/conflict），不会再推进任何步骤；
+//   - 执行先于取消落库（任务刚好 succeeded）：取消返回 conflict，状态保持 succeeded；
+//   - 重复取消以及取消已成功的任务：返回 conflict，终态不再翻转。
+//
+// 取消后冻结的物理链不再受保护，由保留清理按普通规则回收。
+func (s *Service) CancelRestore(ctx context.Context, in CancelRestoreInput) (*RestoreTask, error) {
+	if in.TaskID == "" {
+		return nil, classified(ErrCodeInvalidArgument, "task id is required")
+	}
+	var out *RestoreTask
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetTask(in.TaskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "restore task %s not found", in.TaskID)
+		}
+		if !task.Active() {
+			return classified(ErrCodeConflict, "restore task %s is already %s", task.ID, task.Status)
+		}
+		now := s.timeNow()
+		// 换发租约：epoch 单调递增，旧持有者的一切在途操作立即失效。
+		task.LeaseID = tx.NewID("lease")
+		task.LeaseEpoch++
+		if in.By != "" {
+			task.LeaseHolder = in.By
+		}
+		// 在途（running）步骤回到 failed，保证没有任何步骤停留在 running；
+		// 任务已是终态，这些步骤不会再被派发。
+		for i := range task.Steps {
+			step := &task.Steps[i]
+			if step.Status == StepRunning {
+				step.Status = StepFailed
+				step.ExecutionVersion++
+				if step.LastDetail == "" {
+					step.LastDetail = "reset by cancellation"
+				}
+				t := now
+				step.UpdatedAt = &t
+			}
+		}
+		task.Status = TaskCancelled
+		task.CancelledAt = &now
+		task.CancelReason = in.Reason
+		task.CancelledBy = in.By
+		tx.PutTask(*task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: task.LeaseID, Epoch: task.LeaseEpoch,
+			Holder: task.LeaseHolder, Action: LeaseCancelled, Reason: in.Reason,
+		})
+		out = cloneTask(task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// ListLeaseEvents 返回租约获取/接管/释放/取消的审计记录；taskID 为空时返回全部。
 func (s *Service) ListLeaseEvents(ctx context.Context, taskID string) ([]LeaseEvent, error) {
 	var out []LeaseEvent
 	err := s.store.View(func(tx *Tx) error {
