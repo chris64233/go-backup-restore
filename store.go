@@ -128,7 +128,12 @@ func cloneTask(t *RestoreTask) *RestoreTask {
 		return nil
 	}
 	c := *t
-	c.Chain = append([]FrozenSnapshot(nil), t.Chain...)
+	c.Chain = make([]FrozenSnapshot, len(t.Chain))
+	for i, f := range t.Chain {
+		cf := f
+		cf.ReplacedSnapshots = append([]string(nil), f.ReplacedSnapshots...)
+		c.Chain[i] = cf
+	}
 	c.Steps = make([]RestoreStep, len(t.Steps))
 	for i, st := range t.Steps {
 		cs := st
@@ -150,6 +155,10 @@ func cloneTask(t *RestoreTask) *RestoreTask {
 		tt := *t.CompletedAt
 		c.CompletedAt = &tt
 	}
+	if t.CanceledAt != nil {
+		tt := *t.CanceledAt
+		c.CanceledAt = &tt
+	}
 	return &c
 }
 
@@ -158,7 +167,12 @@ func cloneCompactionTask(t *CompactionTask) *CompactionTask {
 		return nil
 	}
 	c := *t
-	c.Chain = append([]FrozenSnapshot(nil), t.Chain...)
+	c.Chain = make([]FrozenSnapshot, len(t.Chain))
+	for i, f := range t.Chain {
+		cf := f
+		cf.ReplacedSnapshots = append([]string(nil), f.ReplacedSnapshots...)
+		c.Chain[i] = cf
+	}
 	c.Steps = make([]RestoreStep, len(t.Steps))
 	for i, st := range t.Steps {
 		cs := st

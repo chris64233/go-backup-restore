@@ -245,6 +245,27 @@ func (s *Service) GetBackupChain(ctx context.Context, targetSnapshotID string) (
 	return out, nil
 }
 
+// GetEffectiveChain 返回目标快照的“新链”视图：在原始回溯链上应用已发布的
+// 压缩替代（可链式：被替代的完整快照自身也可能被更新的压缩替代）。
+// 未发布任何相关压缩时与 GetBackupChain 一致。时间点恢复冻结计划使用同一套解析。
+func (s *Service) GetEffectiveChain(ctx context.Context, targetSnapshotID string) ([]*Snapshot, error) {
+	var out []*Snapshot
+	err := s.store.View(func(tx *Tx) error {
+		nodes, err := resolveEffectivePlan(tx, targetSnapshotID, s.timeNow())
+		if err != nil {
+			return err
+		}
+		for _, n := range nodes {
+			out = append(out, cloneSnapshot(n.snapshot))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // 恢复创建：冻结链 + 租约
 // ---------------------------------------------------------------------------
@@ -257,8 +278,9 @@ type CreateRestoreInput struct {
 }
 
 // CreateRestore 在单个事务内：
-//  1. 校验目标快照已完成（失败/进行中均不可恢复），并回溯构造到完整快照的链；
-//  2. 冻结链（此后保留清理不得删除链上任何快照）；
+//  1. 校验目标快照已完成（失败/进行中均不可恢复），并回溯构造到完整快照的执行计划
+//     （原始链上应用已发布的压缩替代，压缩产物节点带溯源）；
+//  2. 冻结计划：计划引用的每个快照（含压缩产物折叠的原链节点）此后保留清理不得删除；
 //  3. 取得目标环境的恢复租约（同一环境同时只允许一个有效恢复）。
 func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*RestoreTask, error) {
 	if in.TargetSnapshotID == "" || in.TargetEnvironment == "" || in.Holder == "" {
@@ -276,41 +298,33 @@ func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*Re
 		case StatusPending:
 			return classified(ErrCodeConflict, "snapshot %s is not completed yet", target.ID)
 		}
-		chainSnap, err := walkChain(tx, target.ID)
+		now := s.timeNow()
+		frozen, steps, err := buildFrozenPlan(tx, target, now)
 		if err != nil {
 			return err
-		}
-		for _, sn := range chainSnap {
-			if sn.Status != StatusCompleted {
-				return classified(ErrCodeConflict, "snapshot %s on chain is %s, only completed chains can be restored",
-					sn.ID, sn.Status)
-			}
 		}
 		if existing, ok := tx.FindActiveTaskByEnv(in.TargetEnvironment); ok {
 			return classified(ErrCodeConflict, "target environment %s already has active restore %s (lease %s epoch %d)",
 				in.TargetEnvironment, existing.ID, existing.LeaseID, existing.LeaseEpoch)
 		}
 
-		now := s.timeNow()
-		frozen := make([]FrozenSnapshot, len(chainSnap))
-		steps := make([]RestoreStep, len(chainSnap))
-		for i, sn := range chainSnap {
-			frozen[i] = FrozenSnapshot{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Kind: sn.Kind}
-			steps[i] = RestoreStep{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Status: StepPending}
-		}
 		leaseID := tx.NewID("lease")
 		task := RestoreTask{
-			ID:                tx.NewID("task"),
-			DatasetID:         target.DatasetID,
-			TargetEnvironment: in.TargetEnvironment,
-			TargetSnapshotID:  target.ID,
-			Chain:             frozen,
-			Steps:             steps,
-			Status:            TaskPending,
-			LeaseID:           leaseID,
-			LeaseEpoch:        1,
-			LeaseHolder:       in.Holder,
-			CreatedAt:         now,
+			ID:                 tx.NewID("task"),
+			DatasetID:          target.DatasetID,
+			TargetEnvironment:  in.TargetEnvironment,
+			Mode:               RestoreModeSnapshot,
+			TargetSnapshotID:   target.ID,
+			TargetTime:         *target.CompletedAt,
+			SelectedSnapshotID: target.ID,
+			FrozenAt:           now,
+			Chain:              frozen,
+			Steps:              steps,
+			Status:             TaskPending,
+			LeaseID:            leaseID,
+			LeaseEpoch:         1,
+			LeaseHolder:        in.Holder,
+			CreatedAt:          now,
 		}
 		tx.PutTask(task)
 		tx.AddLeaseEvent(LeaseEvent{
@@ -318,6 +332,116 @@ func (s *Service) CreateRestore(ctx context.Context, in CreateRestoreInput) (*Re
 			Holder: in.Holder, Action: LeaseAcquired,
 		})
 		out = cloneTask(&task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CreatePointInTimeRestoreInput 是按时间点创建恢复的入参。用户只给目标时间，
+// 不给快照 ID：系统负责选出该时间点可见的最新已完成快照。
+type CreatePointInTimeRestoreInput struct {
+	DatasetID         string
+	TargetTime        time.Time
+	TargetEnvironment string
+	Holder            string
+}
+
+// PointInTimeSelection 说明时间点恢复实际选中了什么，便于调用方核对。
+type PointInTimeSelection struct {
+	SelectedSnapshotID string
+	TargetTime         time.Time
+	CompletedAt        time.Time
+}
+
+// CreatePointInTimeRestore 在单个事务内：
+//  1. 在数据集的一致快照上选出“完成时间不晚于目标时间”的最新已完成快照
+//     （不选择完成于目标时间之后的快照，也绝不退而选择最近一个文件）；
+//  2. 从该快照回溯原始链并应用已发布的压缩替代，形成带来源溯源的执行计划；
+//  3. 冻结计划并取得目标环境租约。
+//
+// 冻结后即使有并发链压缩发布或保留清理，这份计划也不会被更换：
+// 计划引用的快照（含被折叠的原链）在任务结束前一律受 active_restore 保护不得回收。
+func (s *Service) CreatePointInTimeRestore(ctx context.Context, in CreatePointInTimeRestoreInput) (*RestoreTask, error) {
+	if in.DatasetID == "" || in.TargetEnvironment == "" || in.Holder == "" {
+		return nil, classified(ErrCodeInvalidArgument, "dataset id, target environment and holder are required")
+	}
+	if in.TargetTime.IsZero() {
+		return nil, classified(ErrCodeInvalidArgument, "target time is required")
+	}
+	targetTime := in.TargetTime.UTC()
+	var out *RestoreTask
+	err := s.store.Update(func(tx *Tx) error {
+		target, err := selectPointInTimeSnapshot(tx, in.DatasetID, targetTime)
+		if err != nil {
+			return err
+		}
+		now := s.timeNow()
+		frozen, steps, err := buildFrozenPlan(tx, target, targetTime)
+		if err != nil {
+			return err
+		}
+		if existing, ok := tx.FindActiveTaskByEnv(in.TargetEnvironment); ok {
+			return classified(ErrCodeConflict, "target environment %s already has active restore %s (lease %s epoch %d)",
+				in.TargetEnvironment, existing.ID, existing.LeaseID, existing.LeaseEpoch)
+		}
+
+		leaseID := tx.NewID("lease")
+		task := RestoreTask{
+			ID:                 tx.NewID("task"),
+			DatasetID:          in.DatasetID,
+			TargetEnvironment:  in.TargetEnvironment,
+			Mode:               RestoreModePointInTime,
+			TargetSnapshotID:   target.ID, // 实际选中的快照即执行目标
+			TargetTime:         targetTime,
+			SelectedSnapshotID: target.ID,
+			FrozenAt:           now,
+			Chain:              frozen,
+			Steps:              steps,
+			Status:             TaskPending,
+			LeaseID:            leaseID,
+			LeaseEpoch:         1,
+			LeaseHolder:        in.Holder,
+			CreatedAt:          now,
+		}
+		tx.PutTask(task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: leaseID, Epoch: 1,
+			Holder: in.Holder, Action: LeaseAcquired,
+			Reason: fmt.Sprintf("point-in-time restore selected %s completed at %s",
+				target.ID, target.CompletedAt.Format(time.RFC3339Nano)),
+		})
+		out = cloneTask(&task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetPointInTimeSelection 以只读方式预览某目标时间会选中哪个快照（不冻结、不建任务）。
+// 不存在不晚于该时间的已完成快照时返回 not_found。
+func (s *Service) GetPointInTimeSelection(ctx context.Context, datasetID string, target time.Time) (*PointInTimeSelection, error) {
+	if datasetID == "" {
+		return nil, classified(ErrCodeInvalidArgument, "dataset id is required")
+	}
+	if target.IsZero() {
+		return nil, classified(ErrCodeInvalidArgument, "target time is required")
+	}
+	var out *PointInTimeSelection
+	err := s.store.View(func(tx *Tx) error {
+		sn, err := selectPointInTimeSnapshot(tx, datasetID, target.UTC())
+		if err != nil {
+			return err
+		}
+		out = &PointInTimeSelection{
+			SelectedSnapshotID: sn.ID,
+			TargetTime:         target.UTC(),
+			CompletedAt:        *sn.CompletedAt,
+		}
 		return nil
 	})
 	if err != nil {
@@ -508,14 +632,18 @@ func (s *Service) CompleteRestore(ctx context.Context, taskID, leaseID string, e
 			return classified(ErrCodeNotFound, "restore task %s not found", taskID)
 		}
 		if !task.Active() {
-			// 幂等：任务已完成，复用已有通知，绝不产生第二条。
-			event, _ := tx.GetOutboxByTask(task.ID)
-			res.Task = cloneTask(task)
-			if event != nil {
-				cp := *event
-				res.Event = &cp
+			if task.Status == TaskSucceeded {
+				// 幂等：任务已完成，复用已有通知，绝不产生第二条。
+				event, _ := tx.GetOutboxByTask(task.ID)
+				res.Task = cloneTask(task)
+				if event != nil {
+					cp := *event
+					res.Event = &cp
+				}
+				return nil
 			}
-			return nil
+			// 已取消：完成与取消竞争中取消胜出，拒绝完成而不是伪装成幂等成功。
+			return classified(ErrCodeConflict, "restore task %s is %s and cannot be completed", task.ID, task.Status)
 		}
 		if err := requireLease(task, leaseID, epoch); err != nil {
 			return err
@@ -550,6 +678,113 @@ func (s *Service) CompleteRestore(ctx context.Context, taskID, leaseID string, e
 		return nil, err
 	}
 	return res, nil
+}
+
+// CancelRestore 取消一个尚未终态的恢复任务。取消与步骤派发/回执/完成并发时，
+// 所有这些操作都在同一个可序列化存储上排队：一旦取消提交，任务进入唯一终态
+// canceled，租约释放，此后任何派发、回执、接管、完成都因任务不再 active 而被拒绝。
+//
+// 已成功的任务不能再取消（返回 conflict，完成与取消竞争中完成胜出）；
+// 对已取消的任务重复取消是幂等的，返回当前任务。步骤状态原样保留，
+// 因此取消后仍能查到实际使用的备份链与停在哪一步。
+func (s *Service) CancelRestore(ctx context.Context, taskID, requestedBy, reason string) (*RestoreTask, error) {
+	if requestedBy == "" {
+		return nil, classified(ErrCodeInvalidArgument, "requested by is required")
+	}
+	var out *RestoreTask
+	err := s.store.Update(func(tx *Tx) error {
+		task, ok := tx.GetTask(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "restore task %s not found", taskID)
+		}
+		if task.Status == TaskCanceled {
+			out = cloneTask(task) // 幂等：取消只有一个终态
+			return nil
+		}
+		if !task.Active() {
+			return classified(ErrCodeConflict, "cannot cancel %s restore task %s", task.Status, task.ID)
+		}
+		now := s.timeNow()
+		task.Status = TaskCanceled
+		task.CanceledAt = &now
+		task.CancelReason = reason
+		tx.PutTask(*task)
+		tx.AddLeaseEvent(LeaseEvent{
+			At: now, TaskID: task.ID, LeaseID: task.LeaseID, Epoch: task.LeaseEpoch,
+			Holder: requestedBy, Action: LeaseReleased,
+			Reason: "restore canceled: " + reason,
+		})
+		out = cloneTask(task)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetRestoreProgress 查询恢复任务的执行进度：实际使用的备份链（含每个节点是原始
+// 备份还是压缩产物、压缩任务来源、被折叠的原链快照）、步骤计数与失败位置。
+// 取消或失败暂停后，这里给出的 FirstFailed 就是恢复将继续的安全位置。
+func (s *Service) GetRestoreProgress(ctx context.Context, taskID string) (*RestoreProgress, error) {
+	var out *RestoreProgress
+	err := s.store.View(func(tx *Tx) error {
+		task, ok := tx.GetTask(taskID)
+		if !ok {
+			return classified(ErrCodeNotFound, "restore task %s not found", taskID)
+		}
+		p := &RestoreProgress{
+			TaskID:             task.ID,
+			Status:             task.Status,
+			DatasetID:          task.DatasetID,
+			Mode:               task.Mode,
+			TargetTime:         task.TargetTime,
+			SelectedSnapshotID: task.SelectedSnapshotID,
+			Total:              len(task.Steps),
+		}
+		p.Plan = make([]PlanNodeView, len(task.Chain))
+		for i, f := range task.Chain {
+			p.Plan[i] = PlanNodeView{
+				Index:             f.Index,
+				SnapshotID:        f.SnapshotID,
+				Digest:            f.Digest,
+				Kind:              f.Kind,
+				Source:            f.Source,
+				CompactionTaskID:  f.CompactionTaskID,
+				ReplacedSnapshots: append([]string(nil), f.ReplacedSnapshots...),
+			}
+		}
+		for _, st := range task.Steps {
+			switch st.Status {
+			case StepPending:
+				p.Pending++
+			case StepRunning:
+				p.Running++
+			case StepSucceeded:
+				p.Succeeded++
+				p.CompletedSteps++
+			case StepFailed:
+				p.Failed++
+			}
+			if st.Status != StepSucceeded {
+				v := StepFailureView{
+					Index: st.Index, SnapshotID: st.SnapshotID, Status: st.Status,
+					Attempts: st.Attempts, LastDetail: st.LastDetail,
+				}
+				p.Failures = append(p.Failures, v)
+				if p.FirstFailed == nil {
+					cp := v
+					p.FirstFailed = &cp
+				}
+			}
+		}
+		out = p
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // TakeoverLease 接管一个有效恢复任务的租约：epoch 单调递增并换发租约 ID，
@@ -669,13 +904,17 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			}
 		}
 
-		// (1) 有效恢复链冻结的内容一律保留。
+		// (1) 有效恢复计划冻结的内容一律保留：计划节点本身（含压缩产物），
+		// 以及压缩产物节点折叠掉的原链快照——它们也被计划引用，任务结束前不得回收。
 		for _, task := range tx.ListTasks() {
 			if !task.Active() {
 				continue
 			}
 			for _, f := range task.Chain {
 				addReason(f.SnapshotID, ReasonActiveRestore)
+				for _, replacedID := range f.ReplacedSnapshots {
+					addReason(replacedID, ReasonActiveRestore)
+				}
 			}
 		}
 
@@ -1289,70 +1528,213 @@ func (s *Service) ListReplacements(ctx context.Context, datasetID string) ([]Rep
 	return out, err
 }
 
-// GetEffectiveChain 返回目标快照的“新链”视图：在原始回溯链上应用已发布的
-// 压缩替代（可链式：被替代的完整快照自身也可能被更新的压缩替代）。
-// 未发布任何相关压缩时与 GetBackupChain 一致。
-func (s *Service) GetEffectiveChain(ctx context.Context, targetSnapshotID string) ([]*Snapshot, error) {
-	var out []*Snapshot
-	err := s.store.View(func(tx *Tx) error {
-		if _, ok := tx.GetSnapshot(targetSnapshotID); !ok {
-			return classified(ErrCodeNotFound, "snapshot %s not found", targetSnapshotID)
-		}
-		chain, err := walkChain(tx, targetSnapshotID)
-		if err != nil {
-			return err
-		}
-		// 反复应用替代段，直到没有可应用的压缩；每次应用都缩短链，保证终止。
-		for {
-			applied := false
-			for i, sn := range chain {
-				rep, ok := tx.GetReplacement(sn.ID)
-				if !ok {
-					continue
-				}
-				task, ok := tx.GetCompaction(rep.CompactionTaskID)
-				if !ok {
-					continue
-				}
-				seg := task.Chain
-				if i+len(seg) > len(chain) {
-					continue
-				}
-				match := true
-				for j, f := range seg {
-					if chain[i+j].ID != f.SnapshotID {
-						match = false
-						break
-					}
-				}
-				if !match {
-					continue
-				}
-				newSnap, ok := tx.GetSnapshot(rep.NewSnapshotID)
-				if !ok {
-					continue
-				}
-				next := make([]*Snapshot, 0, len(chain)-len(seg)+1)
-				next = append(next, chain[:i]...)
-				next = append(next, newSnap)
-				next = append(next, chain[i+len(seg):]...)
-				chain = next
-				applied = true
-				break
-			}
-			if !applied {
-				break
-			}
-		}
-		for _, sn := range chain {
-			out = append(out, cloneSnapshot(sn))
-		}
-		return nil
-	})
+// nodeOrigin 记录执行计划节点相对原始备份链的来历。
+type nodeOrigin struct {
+	// compactionTaskID 非空时表示该节点是这个压缩任务合成出的产物。
+	compactionTaskID string
+	// replaced 是被该节点折叠掉的全部原链快照（链式压缩时含传递闭包）。
+	replaced []string
+}
+
+// resolvedPlanNode 是应用压缩替代后的一个执行计划节点。
+type resolvedPlanNode struct {
+	snapshot         *Snapshot
+	compactionTaskID string
+	replaced         []string
+}
+
+// resolveEffectivePlan 从目标快照沿原始父边回溯得到原始链，然后反复应用
+// asOf 之前（含）已发布的压缩替代（可链式：被替代的压缩产物自身也可能再被压缩），
+// 返回有序执行计划（完整快照在前，目标快照在末尾）。
+//
+// asOf 是时间点边界：只有 PublishedAt 不晚于 asOf 的替代关系才能参与折叠。
+// 时间点恢复传入用户目标时间——目标时刻之后才发布的压缩不属于那份历史，
+// 不得改变冻结计划；直接快照恢复传入冻结时刻（当时已发布的替代全部可见）。
+//
+// 每次折叠都缩短链，保证终止；压缩产物节点记录产出它的压缩任务以及
+// 被折叠的全部原链快照，使计划在“链已被压缩甚至原链已被回收”的情况下
+// 仍然可解释、可复现，而不是简单选择最近一个文件。
+func resolveEffectivePlan(tx *Tx, targetID string, asOf time.Time) ([]resolvedPlanNode, error) {
+	if _, ok := tx.GetSnapshot(targetID); !ok {
+		return nil, classified(ErrCodeNotFound, "snapshot %s not found", targetID)
+	}
+	chain, err := walkChain(tx, targetID)
 	if err != nil {
 		return nil, err
 	}
+	// 每个已发布压缩产物 -> 产出它的压缩任务，用于递归求折叠闭包。
+	resultTask := map[string]*CompactionTask{}
+	for _, c := range tx.ListCompactions() {
+		if c.NewSnapshotID != "" && c.Status == TaskSucceeded {
+			resultTask[c.NewSnapshotID] = c
+		}
+	}
+	// originClosure 返回某节点若是压缩产物时所折叠的全部原链快照（递归传递闭包）。
+	memo := map[string][]string{}
+	var originClosure func(id string) []string
+	originClosure = func(id string) []string {
+		if v, ok := memo[id]; ok {
+			return v
+		}
+		c, isResult := resultTask[id]
+		if !isResult {
+			memo[id] = nil
+			return nil
+		}
+		acc := make([]string, 0)
+		for _, f := range c.Chain {
+			acc = append(acc, f.SnapshotID)
+			acc = append(acc, originClosure(f.SnapshotID)...)
+		}
+		acc = dedupeStrings(acc)
+		memo[id] = acc
+		return acc
+	}
+	// 已折叠产物的溯源：压缩产物 ID -> 来历。
+	origins := map[string]nodeOrigin{}
+	for {
+		applied := false
+		for i, sn := range chain {
+			rep, ok := tx.GetReplacement(sn.ID)
+			if !ok {
+				continue
+			}
+			if rep.PublishedAt.After(asOf) {
+				continue // 目标时间之后才发布的替代不参与这份历史计划
+			}
+			task, ok := tx.GetCompaction(rep.CompactionTaskID)
+			if !ok {
+				continue
+			}
+			seg := task.Chain
+			if i+len(seg) > len(chain) {
+				continue
+			}
+			match := true
+			for j, f := range seg {
+				if chain[i+j].ID != f.SnapshotID {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			newSnap, ok := tx.GetSnapshot(rep.NewSnapshotID)
+			if !ok {
+				continue
+			}
+			// 记录本节点折叠的原链；压缩段内若含更早的压缩产物则递归并入其闭包。
+			origins[newSnap.ID] = nodeOrigin{
+				compactionTaskID: task.ID,
+				replaced:         append([]string(nil), originClosure(newSnap.ID)...),
+			}
+			next := make([]*Snapshot, 0, len(chain)-len(seg)+1)
+			next = append(next, chain[:i]...)
+			next = append(next, newSnap)
+			next = append(next, chain[i+len(seg):]...)
+			chain = next
+			applied = true
+			break
+		}
+		if !applied {
+			break
+		}
+	}
+	out := make([]resolvedPlanNode, len(chain))
+	for i, sn := range chain {
+		out[i] = resolvedPlanNode{snapshot: sn}
+		if m, ok := origins[sn.ID]; ok {
+			out[i].compactionTaskID = m.compactionTaskID
+			out[i].replaced = append([]string(nil), m.replaced...)
+		}
+	}
 	return out, nil
+}
+
+func dedupeStrings(in []string) []string {
+	seen := map[string]bool{}
+	out := in[:0:0]
+	for _, v := range in {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// buildFrozenPlan 把目标快照解析为可冻结的执行计划：在 asOf 时间边界内
+// 应用压缩替代后的有序节点，每个节点带摘要与溯源。
+// 链上任一节点不是 completed 都是冲突（不允许恢复半成品）。
+func buildFrozenPlan(tx *Tx, target *Snapshot, asOf time.Time) ([]FrozenSnapshot, []RestoreStep, error) {
+	nodes, err := resolveEffectivePlan(tx, target.ID, asOf)
+	if err != nil {
+		return nil, nil, err
+	}
+	frozen := make([]FrozenSnapshot, len(nodes))
+	steps := make([]RestoreStep, len(nodes))
+	for i, n := range nodes {
+		sn := n.snapshot
+		if sn.Status != StatusCompleted {
+			return nil, nil, classified(ErrCodeConflict,
+				"snapshot %s on restore plan is %s, only completed chains can be restored", sn.ID, sn.Status)
+		}
+		source := FrozenSourceOriginal
+		if n.compactionTaskID != "" {
+			source = FrozenSourceCompaction
+		}
+		frozen[i] = FrozenSnapshot{
+			Index:             i,
+			SnapshotID:        sn.ID,
+			Digest:            sn.Digest,
+			Kind:              sn.Kind,
+			Source:            source,
+			CompactionTaskID:  n.compactionTaskID,
+			ReplacedSnapshots: append([]string(nil), n.replaced...),
+		}
+		steps[i] = RestoreStep{Index: i, SnapshotID: sn.ID, Digest: sn.Digest, Status: StepPending}
+	}
+	return frozen, steps, nil
+}
+
+// selectPointInTimeSnapshot 在数据集内选出完成时间不晚于 target 的最新已完成快照。
+// 完成时间相同时取 ID 最大者（ID 单调递增，即登记/完成最晚者），保证选择确定性。
+//
+// 压缩合成出的完整快照不参与候选：它是对一段旧链的物理重写，不代表新的数据版本，
+// 其发布时间可能晚于其后继增量——选它会静默丢掉压缩段之后的增量。
+// “是否用压缩产物执行”属于执行计划层面的折叠（buildFrozenPlan），不属于时间点选择。
+// 没有任何满足条件的快照时返回 not_found——调用方不得退而选择“最近一个文件”。
+func selectPointInTimeSnapshot(tx *Tx, datasetID string, target time.Time) (*Snapshot, error) {
+	compactionResults := map[string]bool{}
+	for _, c := range tx.ListCompactions() {
+		if c.NewSnapshotID != "" {
+			compactionResults[c.NewSnapshotID] = true
+		}
+	}
+	var best *Snapshot
+	for _, sn := range tx.ListSnapshotsByDataset(datasetID) {
+		if sn.Status != StatusCompleted || sn.CompletedAt == nil {
+			continue
+		}
+		if compactionResults[sn.ID] {
+			continue
+		}
+		if sn.CompletedAt.After(target) {
+			continue // 完成于目标时间之后的快照不可见
+		}
+		if best == nil ||
+			sn.CompletedAt.After(*best.CompletedAt) ||
+			(sn.CompletedAt.Equal(*best.CompletedAt) && sn.ID > best.ID) {
+			best = sn
+		}
+	}
+	if best == nil {
+		return nil, classified(ErrCodeNotFound,
+			"no completed snapshot in dataset %s at or before %s", datasetID, target.Format(time.RFC3339Nano))
+	}
+	return best, nil
 }
 
 // ReferenceBlock 是一条阻止快照被回收的引用。
@@ -1382,13 +1764,25 @@ func (s *Service) ExplainSnapshotReferences(ctx context.Context, snapshotID stri
 			if !task.Active() {
 				continue
 			}
+		blocked:
 			for _, f := range task.Chain {
 				if f.SnapshotID == snapshotID {
 					res.Blocks = append(res.Blocks, ReferenceBlock{
 						Kind: "restore_task", ID: task.ID,
 						Detail: fmt.Sprintf("frozen by active restore to %s", task.TargetEnvironment),
 					})
-					break
+					break blocked
+				}
+				// 被压缩产物节点折叠的原链快照同样受冻结计划引用。
+				for _, replacedID := range f.ReplacedSnapshots {
+					if replacedID == snapshotID {
+						res.Blocks = append(res.Blocks, ReferenceBlock{
+							Kind: "restore_task", ID: task.ID,
+							Detail: fmt.Sprintf("folded into plan node %s by active restore to %s",
+								f.SnapshotID, task.TargetEnvironment),
+						})
+						break blocked
+					}
 				}
 			}
 		}

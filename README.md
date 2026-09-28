@@ -7,8 +7,11 @@
 | 能力 | 入口 | 说明 |
 | --- | --- | --- |
 | 快照登记 | `RegisterSnapshot` / `MarkSnapshotCompleted` / `MarkSnapshotFailed` | 不可变摘要 + 父快照 + 完成状态 |
-| 恢复创建 | `CreateRestore` | 冻结回溯链并获取目标环境租约 |
-| 步骤推进 | `DispatchNextStep` / `AckStep` | 沿链有序执行，允许重试，回执匹配租约与执行版本 |
+| 恢复创建 | `CreateRestore` | 冻结执行计划（应用压缩替代）并获取目标环境租约 |
+| 时间点恢复 | `CreatePointInTimeRestore` / `GetPointInTimeSelection` | 只给目标时间：选出不晚于该时间的最新已完成快照，解析完整/增量/压缩替代并冻结计划 |
+| 步骤推进 | `DispatchNextStep` / `AckStep` | 沿计划有序执行，允许重试，回执匹配租约与执行版本 |
+| 任务取消 | `CancelRestore` | 与执行并发只留下一个终态；取消后仍可查询计划与失败位置 |
+| 进度查询 | `GetRestoreProgress` | 实际使用的备份链（含压缩溯源）、已完成步骤与失败位置 |
 | 租约接管 | `TakeoverLease` | epoch 单调递增，旧租约回执一律失效 |
 | 任务完成 | `CompleteRestore` | 写出且只写出一次 outbox 通知，重复调用幂等 |
 | 链压缩 | `CreateCompaction` / `DispatchCompactionStep` / `AckCompactionStep` / `TakeoverCompactionLease` / `PublishCompaction` | 一段已完成链合成为新的完整快照，摘要校验通过后原子发布 |
@@ -29,12 +32,40 @@
 
 ### 2. 恢复与租约（fencing）
 
-- `CreateRestore` 在**单个事务**内完成三件事：校验目标快照已完成、回溯并
-  **冻结** 从目标到完整快照的链、获取目标环境的恢复租约。
+- `CreateRestore` 在**单个事务**内完成三件事：校验目标快照已完成、
+  解析并**冻结**执行计划、获取目标环境的恢复租约。
   同一目标环境同时只允许一个有效恢复（`pending`/`running`）。
-- 步骤沿冻结链**有序**派发；失败步骤可重试，每次派发递增该步骤的
+- **执行计划不是“选最近一个文件”**：从目标快照沿原始父边回溯到完整快照，
+  再应用已发布的压缩替代——一段原链被其压缩产物（新的完整快照）整段替换，
+  支持链式压缩。冻结的每个计划节点都带溯源：`Source`（`original` /
+  `compaction`）、产出它的 `CompactionTaskID`、以及被它折叠的全部原链快照
+  （`ReplacedSnapshots`，链式压缩时为递归闭包）。
+- **时间点恢复** `CreatePointInTimeRestore`：用户只给 `DatasetID` + `TargetTime`。
+  - 系统在一致快照上选出**完成时间不晚于目标时间**的最新已完成快照
+    （完成时间相同取 ID 最大者；`pending`/`failed` 不可见；没有满足条件的
+    快照返回 `not_found`，绝不退而选择最近一个文件）。
+  - **压缩产物不参与时间点候选**：它是对旧链的物理重写，发布时间可能晚于
+    其后继增量，直接按时间选它会静默丢掉压缩段之后的增量。“用不用压缩产物”
+    只在计划折叠阶段决定——前缀折叠为产物、后继增量照常保留。
+  - 计划折叠遵守 **as-of 边界**：只有 `PublishedAt ≤ TargetTime` 的替代关系
+    才参与这份历史计划；目标时间之后才发布的压缩不能改写过去。
+  - 可用 `GetPointInTimeSelection` 只读预览会选中哪个快照，不冻结、不建任务。
+- **计划冻结后不可更换**：此后并发链压缩发布或保留清理都不影响这份计划；
+  计划引用的每个快照（计划节点 + 被折叠的原链）在任务结束前一律受
+  `active_restore` 保护，保留清理不得回收。
+- 步骤沿冻结计划**有序**派发；失败步骤可重试，每次派发递增该步骤的
   `ExecutionVersion`。回执必须同时匹配 **租约 ID + epoch** 与
   **步骤执行版本**，否则被拒绝且状态不变。
+- **中断恢复**：任务、计划、每个步骤状态（含执行版本、尝试次数、失败详情）
+  随每个事务原子落盘。进程重启后新执行方 `TakeoverLease` 接管：已成功的步骤
+  保持成功、绝不重复应用，崩溃时在途（`running`）的步骤重置为 `failed` 并
+  提升执行版本，派发从第一个未成功步骤继续；旧持有者的迟到回执因
+  epoch/版本不匹配被挡下。
+- **取消** `CancelRestore`：取消与派发/回执/完成跑在同一个可序列化存储上，
+  提交后任务进入唯一终态 `canceled` 并释放租约；此后任何执行动作都被拒绝，
+  已成功的任务不能再取消，重复取消幂等。取消不写完成 outbox，步骤状态原样保留。
+- `GetRestoreProgress` 查询**实际使用的备份链**（含压缩任务来源与折叠的原链）、
+  步骤计数、已完成步骤数与 `FirstFailed` 失败位置——取消或中断后据此定位与续跑。
 - `TakeoverLease` 换发租约 ID 并递增 epoch，把在途步骤重置为可重试；
   旧租约持有者的迟到回执因 epoch 不匹配被挡下（`lease` 错误），
   无法干扰接管者。租约的获取/接管/释放全部记入审计日志。
@@ -130,6 +161,29 @@ for {
 // 4. 完成（写出唯一 outbox 通知）；执行者失联时由他人 TakeoverLease 接管
 svc.CompleteRestore(ctx, task.ID, task.LeaseID, task.LeaseEpoch)
 
+// 4b. 按时间点恢复：用户只给目标时间，系统选快照并冻结含压缩替代的计划
+//     （压缩产物不参与候选，且只折叠目标时间之前已发布的替代）
+pit, _ := svc.CreatePointInTimeRestore(ctx, backuprestore.CreatePointInTimeRestoreInput{
+    DatasetID: "ds", TargetTime: time.Now().Add(-time.Hour),
+    TargetEnvironment: "prod-b", Holder: "worker-1"})
+// pit.SelectedSnapshotID 是实际选中的快照；pit.Chain 是冻结执行计划，
+// 节点 Source=compaction 时带 CompactionTaskID 与 ReplacedSnapshots 溯源。
+for {
+    d, _ := svc.DispatchNextStep(ctx, pit.ID, pit.LeaseID, pit.LeaseEpoch)
+    if d.Step == nil {
+        break
+    }
+    // ... 执行该步骤；失败可重派，重启后从第一个未成功步骤继续 ...
+    svc.AckStep(ctx, backuprestore.AckStepInput{
+        TaskID: pit.ID, LeaseID: pit.LeaseID, Epoch: pit.LeaseEpoch,
+        StepIndex: d.Step.Index, ExecutionVersion: d.Step.ExecutionVersion,
+        Success: true})
+}
+// 随时可查实际使用的备份链与失败位置；需要中止时 CancelRestore（终态唯一）
+prog, _ := svc.GetRestoreProgress(ctx, pit.ID) // prog.Plan / prog.FirstFailed
+// svc.CancelRestore(ctx, pit.ID, "ops", "no longer needed")
+svc.CompleteRestore(ctx, pit.ID, pit.LeaseID, pit.LeaseEpoch)
+
 // 5. 链压缩：full..inc -> 新的完整快照（任务号幂等）
 ct, _ := svc.CreateCompaction(ctx, backuprestore.CreateCompactionInput{
     FromSnapshotID: full.ID, ToSnapshotID: inc.ID,
@@ -164,8 +218,15 @@ go test -race ./...    # 含并发竞态检测
 ```
 
 测试覆盖：登记规则（父快照状态/跨数据集/摘要唯一/终态迁移）、链查询、
-恢复创建（冻结链、环境唯一租约、不可恢复快照）、步骤有序派发与重试、
+恢复创建（冻结计划、环境唯一租约、不可恢复快照）、步骤有序派发与重试、
 回执的租约/版本匹配、租约接管 fencing、outbox 恰好一次、
+时间点选择（边界含等号、忽略 pending/failed、无满足快照返回 not_found、
+压缩产物不顶替更新增量）、时间点计划与压缩链兼容（前缀折叠为压缩产物、
+as-of 忽略目标时间之后发布的替代、链式压缩的递归折叠闭包）、
+冻结计划不被并发压缩更换且计划引用数据在任务结束前不被回收、
+取消的唯一终态（取消后派发/回执/接管/完成全被拒绝、重复取消幂等、不写 outbox）、
+取消与完成/执行并发只留下一个终态、进度查询的实际链与失败位置、
+中断恢复（FileStore 重启后接管续跑、已成功增量不重复应用、崩溃在途尝试失效）、
 压缩创建（冻结链摘要与数据集版本、链连续性与完成态校验、任务号幂等）、
 压缩步骤重试与接管 fencing、发布的摘要校验与原子性（发布前读者只见原链）、
 同一链并发压缩唯一生效、发布幂等重放、发布后原链的引用阻断与逐个回收、
@@ -176,10 +237,10 @@ go test -race ./...    # 含并发竞态检测
 ## 代码结构
 
 ```
-domain.go          领域模型：快照、冻结链、恢复/压缩任务、步骤、租约事件、
-                   outbox、保留决策、替代关系
+domain.go          领域模型：快照、冻结计划（含压缩溯源）、恢复/压缩任务、步骤、
+                   租约事件、outbox、保留决策、替代关系、恢复进度
 errors.go          错误分类（ErrorCode）与 *Error
 store.go           事务式 Store 接口、内存实现、原子落盘的 FileStore
-service.go         业务规则：登记/恢复/压缩/发布/接管/保留/查询
+service.go         业务规则：时间点选择/计划折叠/登记/恢复/取消/压缩/发布/接管/保留/查询
 *_test.go          自动化测试（含 -race 并发用例）
 ```
