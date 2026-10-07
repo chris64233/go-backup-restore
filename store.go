@@ -14,30 +14,36 @@ import (
 // 提交成功后整体替换，因此每个事务都工作在一个可序列化的一致快照上：
 // 保留清理看到的引用关系，绝不会是快照登记/恢复创建执行到一半的中间状态。
 type state struct {
-	Snapshots       map[string]*Snapshot       `json:"snapshots"`
-	Tasks           map[string]*RestoreTask    `json:"tasks"`
-	Compactions     map[string]*CompactionTask `json:"compactions"`
-	CompactionByKey map[string]string          `json:"compaction_by_key"`
-	Replacements    map[string]*Replacement    `json:"replacements"`
-	DatasetVersions map[string]int64           `json:"dataset_versions"`
-	Outbox          map[string]*OutboxEvent    `json:"outbox"`
-	OutboxByTask    map[string]string          `json:"outbox_by_task"`
-	LeaseEvents     []LeaseEvent               `json:"lease_events"`
-	RetentionRuns   []*RetentionRun            `json:"retention_runs"`
-	IDSeq           map[string]int64           `json:"id_seq"`
+	Snapshots           map[string]*Snapshot            `json:"snapshots"`
+	Tasks               map[string]*RestoreTask         `json:"tasks"`
+	Compactions         map[string]*CompactionTask      `json:"compactions"`
+	CompactionByKey     map[string]string               `json:"compaction_by_key"`
+	Replacements        map[string]*Replacement         `json:"replacements"`
+	DatasetVersions     map[string]int64                `json:"dataset_versions"`
+	Outbox              map[string]*OutboxEvent         `json:"outbox"`
+	OutboxByTask        map[string]string               `json:"outbox_by_task"`
+	LeaseEvents         []LeaseEvent                    `json:"lease_events"`
+	RetentionRuns       []*RetentionRun                 `json:"retention_runs"`
+	Verifications       map[string]*RestoreVerification `json:"verifications"`
+	VerificationByKey   map[string]string               `json:"verification_by_key"`
+	PublishedVerifyTask map[string]string               `json:"published_verify_task"`
+	IDSeq               map[string]int64                `json:"id_seq"`
 }
 
 func newState() *state {
 	return &state{
-		Snapshots:       map[string]*Snapshot{},
-		Tasks:           map[string]*RestoreTask{},
-		Compactions:     map[string]*CompactionTask{},
-		CompactionByKey: map[string]string{},
-		Replacements:    map[string]*Replacement{},
-		DatasetVersions: map[string]int64{},
-		Outbox:          map[string]*OutboxEvent{},
-		OutboxByTask:    map[string]string{},
-		IDSeq:           map[string]int64{},
+		Snapshots:           map[string]*Snapshot{},
+		Tasks:               map[string]*RestoreTask{},
+		Compactions:         map[string]*CompactionTask{},
+		CompactionByKey:     map[string]string{},
+		Replacements:        map[string]*Replacement{},
+		DatasetVersions:     map[string]int64{},
+		Outbox:              map[string]*OutboxEvent{},
+		OutboxByTask:        map[string]string{},
+		Verifications:       map[string]*RestoreVerification{},
+		VerificationByKey:   map[string]string{},
+		PublishedVerifyTask: map[string]string{},
+		IDSeq:               map[string]int64{},
 	}
 }
 
@@ -70,6 +76,15 @@ func (s *state) normalize() {
 	}
 	if s.IDSeq == nil {
 		s.IDSeq = fresh.IDSeq
+	}
+	if s.Verifications == nil {
+		s.Verifications = fresh.Verifications
+	}
+	if s.VerificationByKey == nil {
+		s.VerificationByKey = fresh.VerificationByKey
+	}
+	if s.PublishedVerifyTask == nil {
+		s.PublishedVerifyTask = fresh.PublishedVerifyTask
 	}
 }
 
@@ -104,6 +119,15 @@ func (s *state) clone() *state {
 	c.LeaseEvents = append(c.LeaseEvents, s.LeaseEvents...)
 	for _, r := range s.RetentionRuns {
 		c.RetentionRuns = append(c.RetentionRuns, cloneRetentionRun(r))
+	}
+	for k, v := range s.Verifications {
+		c.Verifications[k] = cloneVerification(v)
+	}
+	for k, v := range s.VerificationByKey {
+		c.VerificationByKey[k] = v
+	}
+	for k, v := range s.PublishedVerifyTask {
+		c.PublishedVerifyTask[k] = v
 	}
 	for k, v := range s.IDSeq {
 		c.IDSeq[k] = v
@@ -194,6 +218,23 @@ func cloneRetentionRun(r *RetentionRun) *RetentionRun {
 		cd := d
 		cd.Reasons = append([]string(nil), d.Reasons...)
 		c.Decisions[i] = cd
+	}
+	return &c
+}
+
+func cloneVerification(v *RestoreVerification) *RestoreVerification {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.RestoreChain = append([]FrozenSnapshot(nil), v.RestoreChain...)
+	c.Manifest = make([]RestoreManifestFile, len(v.Manifest))
+	copy(c.Manifest, v.Manifest)
+	c.Blocks = make([]RestoreBlock, len(v.Blocks))
+	copy(c.Blocks, v.Blocks)
+	if v.PublishedAt != nil {
+		t := *v.PublishedAt
+		c.PublishedAt = &t
 	}
 	return &c
 }
@@ -393,6 +434,53 @@ func (tx *Tx) ListRetentionRuns() []*RetentionRun {
 	return out
 }
 
+func (tx *Tx) GetVerification(id string) (*RestoreVerification, bool) {
+	v, ok := tx.st.Verifications[id]
+	return v, ok
+}
+
+// FindVerificationByKey 按幂等键查找校验记录。
+func (tx *Tx) FindVerificationByKey(key string) (*RestoreVerification, bool) {
+	id, ok := tx.st.VerificationByKey[key]
+	if !ok {
+		return nil, false
+	}
+	return tx.GetVerification(id)
+}
+
+// PublishedVerificationForTask 返回恢复任务当前已发布的校验记录 ID。
+func (tx *Tx) PublishedVerificationForTask(taskID string) (string, bool) {
+	id, ok := tx.st.PublishedVerifyTask[taskID]
+	return id, ok
+}
+
+// ListVerifications 按创建时间列出全部校验记录。
+func (tx *Tx) ListVerifications() []*RestoreVerification {
+	out := make([]*RestoreVerification, 0, len(tx.st.Verifications))
+	for _, v := range tx.st.Verifications {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+// ListVerificationsForTask 按创建时间列出某恢复任务的全部校验记录
+// （包含未发布的历史重跑，便于核对新差异作为独立记录保存）。
+func (tx *Tx) ListVerificationsForTask(taskID string) []*RestoreVerification {
+	out := make([]*RestoreVerification, 0)
+	for _, v := range tx.ListVerifications() {
+		if v.TaskID == taskID {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // ---------- 写方法 ----------
 
 func (tx *Tx) PutSnapshot(s Snapshot) { tx.st.Snapshots[s.ID] = &s }
@@ -449,6 +537,25 @@ func (tx *Tx) MarkOutboxDelivered(eventID string, at time.Time) error {
 func (tx *Tx) AddLeaseEvent(e LeaseEvent) { tx.st.LeaseEvents = append(tx.st.LeaseEvents, e) }
 
 func (tx *Tx) AddRetentionRun(r RetentionRun) { tx.st.RetentionRuns = append(tx.st.RetentionRuns, &r) }
+
+// PutVerification 写入校验记录，并维护幂等键索引。
+func (tx *Tx) PutVerification(v RestoreVerification) {
+	tx.st.Verifications[v.ID] = &v
+	if v.IdempotencyKey != "" {
+		tx.st.VerificationByKey[v.IdempotencyKey] = v.ID
+	}
+}
+
+// MarkVerificationPublished 发布校验并在存储层登记“每任务至多一条已发布记录”：
+// 已有其他记录发布则返回 conflict，是“已发布结果不能被静默替换”的存储层兜底。
+func (tx *Tx) MarkVerificationPublished(taskID, verificationID string) error {
+	if existing, ok := tx.st.PublishedVerifyTask[taskID]; ok {
+		return classified(ErrCodeConflict,
+			"restore task %s already has published verification %s", taskID, existing)
+	}
+	tx.st.PublishedVerifyTask[taskID] = verificationID
+	return nil
+}
 
 // NewID 生成持久化的单调递增 ID（重启不回退）。
 func (tx *Tx) NewID(kind string) string {

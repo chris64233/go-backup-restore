@@ -689,6 +689,17 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			}
 		}
 
+		// (1c) 正在校验（未发布）的恢复记录冻结的源备份链同样保留：
+		// 校验范围在创建时冻结，源链变化不得悄悄改变正在校验的范围。
+		for _, v := range tx.ListVerifications() {
+			if !v.Active() {
+				continue
+			}
+			for _, f := range v.RestoreChain {
+				addReason(f.SnapshotID, ReasonActiveRestore)
+			}
+		}
+
 		// (2) 保留策略：每个数据集最近 N 个已完成快照，外加它们的祖先链。
 		for datasetID, rule := range covered {
 			var completed []*Snapshot

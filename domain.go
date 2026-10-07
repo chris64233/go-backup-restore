@@ -94,9 +94,13 @@ type RestoreTask struct {
 	LeaseID           string
 	LeaseEpoch        int64
 	LeaseHolder       string
-	CreatedAt         time.Time
-	StartedAt         *time.Time
-	CompletedAt       *time.Time
+	// 恢复目录只有在一条校验记录发布（全部数据块摘要通过）后才可用。
+	// 发布前 Available 为 false；一旦发布即冻结，后来的重跑不能静默改写。
+	Available               bool
+	PublishedVerificationID string
+	CreatedAt               time.Time
+	StartedAt               *time.Time
+	CompletedAt             *time.Time
 }
 
 // Active 表示任务是否仍占用目标环境与链上快照。
@@ -212,4 +216,89 @@ type RetentionRun struct {
 	DecidedAt time.Time
 	Rules     []RetentionRule
 	Decisions []RetentionDecision
+}
+
+// VerificationStatus 是恢复校验记录的状态。
+// 数据块允许部分失败与重试，因此校验在发布前一直保持 running；
+// 只有全部数据块摘要通过并发布后才迁移到 published（终态，不可再改）。
+type VerificationStatus string
+
+const (
+	VerificationRunning   VerificationStatus = "running"
+	VerificationPublished VerificationStatus = "published"
+)
+
+// BlockStatus 是单个数据块的校验状态。失败块可重新回报，matched 不可回退。
+type BlockStatus string
+
+const (
+	BlockPending BlockStatus = "pending" // 尚未回报
+	BlockMatched BlockStatus = "matched" // 摘要一致，重启后可复用
+	BlockFailed  BlockStatus = "failed"  // 摘要不一致，等待重试
+)
+
+// RestoreManifestFile 是恢复产物清单中的一个文件。清单在创建校验时冻结，
+// 此后校验范围只针对这批文件，与源备份链的后续变化无关。
+type RestoreManifestFile struct {
+	Index  int
+	Path   string
+	Size   int64
+	Digest string // 文件整体摘要
+	Blocks int    // 该文件被切分为多少个数据块
+}
+
+// RestoreBlock 标识一个被校验的数据块（文件内按块序号定位），
+// 并记录期望摘要与执行方最近一次回报的实际摘要。
+type RestoreBlock struct {
+	FileIndex      int
+	BlockIndex     int
+	ExpectedDigest string
+	Status         BlockStatus
+	ObservedDigest string
+	Attempts       int32
+	LastDetail     string
+}
+
+// BlockMismatch 描述一个摘要不一致的数据块，供查询精确指出文件与数据块。
+type BlockMismatch struct {
+	FileIndex      int
+	Path           string
+	BlockIndex     int
+	ExpectedDigest string
+	ObservedDigest string
+	Detail         string
+}
+
+// RestoreVerification 是一次恢复产物的校验记录：创建时冻结恢复计划
+// （恢复任务与其备份链）、目标时间、输出版本和文件清单，数据块可分批
+// 回报、失败可重试；只有全部数据块摘要通过才允许发布，发布后恢复目录
+// 才标记为可用。记录一经发布永不修改。
+type RestoreVerification struct {
+	ID                string
+	IdempotencyKey    string
+	TaskID            string
+	DatasetID         string
+	TargetEnvironment string
+	// 冻结的恢复计划：创建校验时恢复任务所冻结的备份链（完整快照在前）。
+	RestoreChain  []FrozenSnapshot
+	TargetTime    time.Time
+	OutputVersion string
+	Manifest      []RestoreManifestFile
+	Blocks        []RestoreBlock
+	Status        VerificationStatus
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+	PublishedAt   *time.Time
+}
+
+// Active 表示校验是否仍在进行（占用冻结链，未发布也未放弃）。
+func (v RestoreVerification) Active() bool { return v.Status == VerificationRunning }
+
+// fileBlockOffset 返回某文件的数据块在 Blocks 切片中的起始下标。
+func fileBlockOffset(manifest []RestoreManifestFile, fileIndex int) int {
+	offset := 0
+	for i := 0; i < fileIndex && i < len(manifest); i++ {
+		offset += manifest[i].Blocks
+	}
+	return offset
 }
