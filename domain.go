@@ -188,6 +188,7 @@ const (
 const (
 	ReasonActiveRestore        = "active_restore"
 	ReasonActiveCompaction     = "active_compaction"
+	ReasonActiveVerification   = "active_verification"
 	ReasonRetentionPolicy      = "retention_policy"
 	ReasonIncompleteSnapshot   = "incomplete_snapshot"
 	ReasonAncestorIncomplete   = "ancestor_of_incomplete_snapshot"
@@ -212,4 +213,103 @@ type RetentionRun struct {
 	DecidedAt time.Time
 	Rules     []RetentionRule
 	Decisions []RetentionDecision
+}
+
+// ---------------------------------------------------------------------------
+// 恢复校验
+// ---------------------------------------------------------------------------
+
+// ManifestFile 是一次恢复输出清单中的单个文件：文件级摘要与分块摘要都在校验前冻结，
+// 此后源备份链的任何变化都不会改变正在校验的范围。
+type ManifestFile struct {
+	Name         string
+	Size         int64
+	Digest       string   // 文件级期望摘要
+	BlockDigests []string // 每个数据块的期望摘要（按块序）
+}
+
+// VerificationStatus 校验记录状态机：
+// verifying -> published（全部摘要通过并发布，目录可用）；
+// verifying 本身也可以长期停留在部分成功状态（failed 块可重试），
+// 记录没有 failed 终态：部分成功永远不等于可用。
+type VerificationStatus string
+
+const (
+	VerificationVerifying VerificationStatus = "verifying"
+	VerificationPublished VerificationStatus = "published"
+	// VerificationSuperseded 表示该未发布校验被一次显式重启取代：
+	// 记录保留作为历史，但永远不能发布，避免多份互相矛盾的目录。
+	VerificationSuperseded VerificationStatus = "superseded"
+)
+
+// VerificationBlockStatus 单个数据块的校验状态。
+// passed 一经确认不可回退；failed 可以反复重试直到通过。
+type VerificationBlockStatus string
+
+const (
+	BlockPending VerificationBlockStatus = "pending"
+	BlockPassed  VerificationBlockStatus = "passed"
+	BlockFailed  VerificationBlockStatus = "failed"
+)
+
+// VerificationBlock 是一个数据块的校验结论。ExpectedDigest 在创建时冻结；
+// ObservedDigest 记录最近一次实际算出的摘要，摘要不一致时据此指出具体块。
+type VerificationBlock struct {
+	File           string
+	Index          int
+	ExpectedDigest string
+	Status         VerificationBlockStatus
+	ObservedDigest string
+	Attempts       int32
+	LastDetail     string
+	UpdatedAt      *time.Time
+}
+
+// RestoreVerification 是一次恢复校验请求的不可变范围与逐步累积的校验结论。
+// 范围（恢复计划、目标时间、输出版本、文件清单）在创建时冻结并参与幂等判定；
+// 只有全部数据块摘要通过并再次确认输出版本后才发布，发布后不可被静默替换。
+type RestoreVerification struct {
+	ID                string
+	RequestKey        string // 请求幂等键：相同键返回原结论，范围变化报冲突
+	RestoreTaskID     string
+	DatasetID         string
+	TargetEnvironment string
+	TargetSnapshotID  string
+	Plan              []FrozenSnapshot // 创建时从恢复任务冻结的恢复计划（链 + 摘要）
+	TargetTime        time.Time
+	OutputVersion     string
+	OutputDir         string
+	Manifest          []ManifestFile
+	ManifestDigest    string // 清单规范化摘要，用于检测重跑差异
+	Blocks            []VerificationBlock
+	Status            VerificationStatus
+	CreatedAt         time.Time
+	UpdatedAt         *time.Time
+	PublishedAt       *time.Time
+}
+
+// Active 表示校验是否仍可能发布（占用恢复计划的引用）。
+func (v RestoreVerification) Active() bool { return v.Status == VerificationVerifying }
+
+// Available 表示恢复目录是否可对外使用：只有已发布的校验记录代表可用。
+func (v RestoreVerification) Available() bool { return v.Status == VerificationPublished }
+
+// BlockDigestDiff 是一个摘要不一致的数据块定位信息。
+type BlockDigestDiff struct {
+	File           string
+	Index          int
+	ExpectedDigest string
+	ObservedDigest string
+	Detail         string
+}
+
+// VerificationView 是校验查询视图：恢复来源、块摘要差异与最终可用状态。
+type VerificationView struct {
+	Verification *RestoreVerification
+	Total        int
+	Passed       int
+	Failed       int
+	Pending      int
+	Diffs        []BlockDigestDiff
+	Available    bool
 }

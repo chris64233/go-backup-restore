@@ -11,6 +11,8 @@
 | 步骤推进 | `DispatchNextStep` / `AckStep` | 沿链有序执行，允许重试，回执匹配租约与执行版本 |
 | 租约接管 | `TakeoverLease` | epoch 单调递增，旧租约回执一律失效 |
 | 任务完成 | `CompleteRestore` | 写出且只写出一次 outbox 通知，重复调用幂等 |
+| 恢复校验 | `CreateVerification` / `VerifyBlocks` / `PublishVerification` | 范围冻结、分批块校验与重试，全部摘要通过后才发布可用 |
+| 校验查询 | `GetVerification` / `ListVerifications` / `GetRestoreOutputStatus` | 恢复来源、块摘要差异定位与最终可用状态 |
 | 链压缩 | `CreateCompaction` / `DispatchCompactionStep` / `AckCompactionStep` / `TakeoverCompactionLease` / `PublishCompaction` | 一段已完成链合成为新的完整快照，摘要校验通过后原子发布 |
 | 保留清理 | `RunRetention` | 一致快照上决策，逐条记录原因并落库 |
 | 备份链查询 | `GetBackupChain` / `GetEffectiveChain` / `ListDatasetSnapshots` / `GetRestoreTask` / `ListLeaseEvents` / `ListRetentionRuns` / `ListOutboxEvents` | 只读视图 |
@@ -40,6 +42,33 @@
   无法干扰接管者。租约的获取/接管/释放全部记入审计日志。
 - `CompleteRestore` 要求全部步骤成功；完成时写出**唯一一条** outbox 通知
   （存储层 `outbox_by_task` 唯一约束兜底），重复完成幂等返回同一事件。
+
+### 2b. 恢复校验（发布前不可用）
+
+恢复执行完成只代表数据已写出；在**校验发布之前恢复目录一律不可用**：
+- `CreateVerification` 在单个事务内冻结校验范围：从恢复任务复制**恢复计划**
+  （链节点与摘要）、**目标时间**、**输出版本**、**文件清单**（文件摘要 + 逐块摘要），
+  并计算规范化的清单摘要。范围一经锁定，源备份链之后的任何变化都不会改变
+  正在校验的范围；发布时还会再次比对恢复计划与输出版本。
+- **请求幂等与冲突**：`RequestKey` 相同的重复提交返回同一条原结论；
+  恢复计划、目标时间、输出版本或清单摘要任一不同都报 `conflict`，绝不静默复用。
+  同一恢复任务同时只允许一个未发布校验，普通重复创建直接冲突。
+- **分块校验与重试**：`VerifyBlocks` 分批提交块结果（可跨文件、可多次调用）。
+  实际摘要与冻结期望一致才置 `passed`（一经通过不可回退）；不一致或失败置
+  `failed` 并记录实际摘要，失败块可反复重试。**部分成功永远不可发布**：
+  任何 `failed`/`pending` 块存在时 `PublishVerification` 都报 `conflict`，目录保持不可用。
+- **发布与重跑**：全部块通过且输出版本重新确认一致后才置 `published`
+  （目录可用），重复发布幂等返回同一结论。已发布结果**永不被后来的重跑静默替换**：
+  重跑（不同版本/清单）创建**新的校验记录**，新旧记录并存于查询视图。
+- **重启复用**：显式 `Restart: true` 会把旧的未发布校验置为 `superseded`
+  （保留历史但永远禁止发布，避免多份互相矛盾的目录），新记录只复用
+  “文件 + 块号 + 期望摘要”完全一致且已通过的块；失败块、期望摘要变化的块
+  以及输出版本必须重新确认。
+- **查询**：`GetVerification` / `ListVerifications` 展示恢复来源（数据集、
+  目标环境、目标快照、计划与输出目录）、块计数与可用状态；摘要不一致时
+  `Diffs` 指出具体**文件与数据块**及期望/实际摘要。
+  `GetRestoreOutputStatus` 汇总恢复目录的最终可用状态、当前已发布结论与全部历史记录。
+- 未发布校验冻结的源链快照受保留清理保护（原因 `active_verification`）。
 
 ### 3. 链压缩（增量链 -> 新完整快照）
 
@@ -77,6 +106,7 @@
 - 以下内容一律保留（原因写入决策记录）：
   - 仍被**有效恢复链**冻结的快照（`active_restore`）；
   - 仍被**有效压缩任务**冻结的原链快照（`active_compaction`）；
+  - 仍被**未发布恢复校验**冻结的恢复计划快照（`active_verification`）；
   - 命中**保留策略**的最近 N 个已完成快照及其全部祖先
     （`retention_policy` / `ancestor_of_retained_snapshot`）；
   - **未完成（pending）子快照**自身及其祖先链
@@ -130,6 +160,31 @@ for {
 // 4. 完成（写出唯一 outbox 通知）；执行者失联时由他人 TakeoverLease 接管
 svc.CompleteRestore(ctx, task.ID, task.LeaseID, task.LeaseEpoch)
 
+// 4b. 恢复校验：范围冻结 -> 分批核对块摘要 -> 全部通过后发布，目录才可用
+manifest := []backuprestore.ManifestFile{
+    {Name: "data/a.db", Size: 20, Digest: "sha256:file-a",
+        BlockDigests: []string{"sha256:a0", "sha256:a1"}},
+}
+ver, _ := svc.CreateVerification(ctx, backuprestore.CreateVerificationInput{
+    RequestKey: "verify-2026-10-01-001", RestoreTaskID: task.ID,
+    TargetTime: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC),
+    OutputVersion: "image-v1.2.3", OutputDir: "/restore/prod-a",
+    Manifest: manifest}) // 同键重放返回原记录；范围变化报 conflict
+for batch := range resultBatches { // 可分批、可重试；失败块下一批重交即可
+    rs := make([]backuprestore.BlockResult, 0)
+    // ... 读取实际恢复文件并逐块计算摘要 ...
+    svc.VerifyBlocks(ctx, backuprestore.VerifyBlocksInput{
+        VerificationID: ver.ID, Results: rs})
+}
+// 发布前再次确认输出版本；存在任何未通过块都会失败，目录保持不可用
+pub, _ := svc.PublishVerification(ctx, backuprestore.PublishVerificationInput{
+    VerificationID: ver.ID, OutputVersion: "image-v1.2.3"})
+_ = pub.Available() // true：恢复目录现在可对外使用
+
+// 重跑（新版本/新差异）必须新建校验；已发布结果不会被静默替换
+status, _ := svc.GetRestoreOutputStatus(ctx, task.ID)
+_ = status.Available // 当前可用结论 + 全部历史校验记录
+
 // 5. 链压缩：full..inc -> 新的完整快照（任务号幂等）
 ct, _ := svc.CreateCompaction(ctx, backuprestore.CreateCompactionInput{
     FromSnapshotID: full.ID, ToSnapshotID: inc.ID,
@@ -171,15 +226,22 @@ go test -race ./...    # 含并发竞态检测
 同一链并发压缩唯一生效、发布幂等重放、发布后原链的引用阻断与逐个回收、
 恢复与回收竞争不产生断裂链、链式压缩的新旧链查询、
 保留清理的保护规则与原因记录、并发下“同一环境仅一个有效恢复”与
-“清理不删被引用快照”、FileStore 重启恢复与事务回滚。
+“清理不删被引用快照”、FileStore 重启恢复与事务回滚、
+恢复校验的范围冻结（计划/目标时间/输出版本/清单）、同键幂等与范围冲突、
+分批块校验的部分失败与失败块重试、摘要不一致的文件/块定位、
+全部通过才可发布与部分成功保持不可用、发布幂等与并发发布/创建竞态、
+已发布结果不被重跑静默替换（新差异作为新记录）、
+重启后仅复用已通过块并重新确认失败块与输出版本（旧记录 superseded 禁止发布）、
+未发布校验对源链的保留保护、校验记录的 FileStore 重启恢复。
 
 ## 代码结构
 
 ```
 domain.go          领域模型：快照、冻结链、恢复/压缩任务、步骤、租约事件、
-                   outbox、保留决策、替代关系
+                   outbox、保留决策、替代关系、恢复校验（范围/块/可用状态）
 errors.go          错误分类（ErrorCode）与 *Error
 store.go           事务式 Store 接口、内存实现、原子落盘的 FileStore
 service.go         业务规则：登记/恢复/压缩/发布/接管/保留/查询
+verification.go    恢复校验：范围冻结、分批块校验、发布与可用性查询
 *_test.go          自动化测试（含 -race 并发用例）
 ```

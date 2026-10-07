@@ -689,6 +689,16 @@ func (s *Service) RunRetention(ctx context.Context, rules []RetentionRule) (*Ret
 			}
 		}
 
+		// (1c) 未发布校验冻结的恢复计划同样保留：校验完成前源链不得被回收。
+		for _, v := range tx.ListVerifications() {
+			if !v.Active() {
+				continue
+			}
+			for _, p := range v.Plan {
+				addReason(p.SnapshotID, ReasonActiveVerification)
+			}
+		}
+
 		// (2) 保留策略：每个数据集最近 N 个已完成快照，外加它们的祖先链。
 		for datasetID, rule := range covered {
 			var completed []*Snapshot

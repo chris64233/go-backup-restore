@@ -14,23 +14,25 @@ import (
 // 提交成功后整体替换，因此每个事务都工作在一个可序列化的一致快照上：
 // 保留清理看到的引用关系，绝不会是快照登记/恢复创建执行到一半的中间状态。
 type state struct {
-	Snapshots       map[string]*Snapshot       `json:"snapshots"`
-	Tasks           map[string]*RestoreTask    `json:"tasks"`
-	Compactions     map[string]*CompactionTask `json:"compactions"`
-	CompactionByKey map[string]string          `json:"compaction_by_key"`
-	Replacements    map[string]*Replacement    `json:"replacements"`
-	DatasetVersions map[string]int64           `json:"dataset_versions"`
-	Outbox          map[string]*OutboxEvent    `json:"outbox"`
-	OutboxByTask    map[string]string          `json:"outbox_by_task"`
-	LeaseEvents     []LeaseEvent               `json:"lease_events"`
-	RetentionRuns   []*RetentionRun            `json:"retention_runs"`
-	IDSeq           map[string]int64           `json:"id_seq"`
+	Snapshots       map[string]*Snapshot            `json:"snapshots"`
+	Tasks           map[string]*RestoreTask         `json:"tasks"`
+	Verifications   map[string]*RestoreVerification `json:"verifications"`
+	Compactions     map[string]*CompactionTask      `json:"compactions"`
+	CompactionByKey map[string]string               `json:"compaction_by_key"`
+	Replacements    map[string]*Replacement         `json:"replacements"`
+	DatasetVersions map[string]int64                `json:"dataset_versions"`
+	Outbox          map[string]*OutboxEvent         `json:"outbox"`
+	OutboxByTask    map[string]string               `json:"outbox_by_task"`
+	LeaseEvents     []LeaseEvent                    `json:"lease_events"`
+	RetentionRuns   []*RetentionRun                 `json:"retention_runs"`
+	IDSeq           map[string]int64                `json:"id_seq"`
 }
 
 func newState() *state {
 	return &state{
 		Snapshots:       map[string]*Snapshot{},
 		Tasks:           map[string]*RestoreTask{},
+		Verifications:   map[string]*RestoreVerification{},
 		Compactions:     map[string]*CompactionTask{},
 		CompactionByKey: map[string]string{},
 		Replacements:    map[string]*Replacement{},
@@ -49,6 +51,9 @@ func (s *state) normalize() {
 	}
 	if s.Tasks == nil {
 		s.Tasks = fresh.Tasks
+	}
+	if s.Verifications == nil {
+		s.Verifications = fresh.Verifications
 	}
 	if s.Compactions == nil {
 		s.Compactions = fresh.Compactions
@@ -80,6 +85,9 @@ func (s *state) clone() *state {
 	}
 	for k, v := range s.Tasks {
 		c.Tasks[k] = cloneTask(v)
+	}
+	for k, v := range s.Verifications {
+		c.Verifications[k] = cloneVerification(v)
 	}
 	for k, v := range s.Compactions {
 		c.Compactions[k] = cloneCompactionTask(v)
@@ -179,6 +187,39 @@ func cloneCompactionTask(t *CompactionTask) *CompactionTask {
 	if t.CompletedAt != nil {
 		tt := *t.CompletedAt
 		c.CompletedAt = &tt
+	}
+	return &c
+}
+
+func cloneVerification(v *RestoreVerification) *RestoreVerification {
+	if v == nil {
+		return nil
+	}
+	c := *v
+	c.Plan = append([]FrozenSnapshot(nil), v.Plan...)
+	c.Manifest = make([]ManifestFile, len(v.Manifest))
+	for i, f := range v.Manifest {
+		c.Manifest[i] = ManifestFile{
+			Name: f.Name, Size: f.Size, Digest: f.Digest,
+			BlockDigests: append([]string(nil), f.BlockDigests...),
+		}
+	}
+	c.Blocks = make([]VerificationBlock, len(v.Blocks))
+	for i, b := range v.Blocks {
+		cb := b
+		if b.UpdatedAt != nil {
+			t := *b.UpdatedAt
+			cb.UpdatedAt = &t
+		}
+		c.Blocks[i] = cb
+	}
+	if v.UpdatedAt != nil {
+		t := *v.UpdatedAt
+		c.UpdatedAt = &t
+	}
+	if v.PublishedAt != nil {
+		t := *v.PublishedAt
+		c.PublishedAt = &t
 	}
 	return &c
 }
@@ -402,6 +443,59 @@ func (tx *Tx) DeleteSnapshot(id string) {
 }
 
 func (tx *Tx) PutTask(t RestoreTask) { tx.st.Tasks[t.ID] = &t }
+
+func (tx *Tx) GetVerification(id string) (*RestoreVerification, bool) {
+	v, ok := tx.st.Verifications[id]
+	return v, ok
+}
+
+// FindVerificationByRequest 按请求幂等键查找校验记录。
+func (tx *Tx) FindVerificationByRequest(key string) (*RestoreVerification, bool) {
+	for _, v := range tx.st.Verifications {
+		if v.RequestKey == key {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+// ListVerificationsByTask 返回某恢复任务的全部校验记录（含已发布的历史结果），
+// 按创建时间排序。
+func (tx *Tx) ListVerificationsByTask(taskID string) []*RestoreVerification {
+	out := make([]*RestoreVerification, 0)
+	for _, v := range tx.ListVerifications() {
+		if v.RestoreTaskID == taskID {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// LatestVerificationByTask 返回恢复任务最近创建的一条校验记录。
+func (tx *Tx) LatestVerificationByTask(taskID string) (*RestoreVerification, bool) {
+	list := tx.ListVerificationsByTask(taskID)
+	if len(list) == 0 {
+		return nil, false
+	}
+	return list[len(list)-1], true
+}
+
+// ListVerifications 按创建时间列出全部校验记录。
+func (tx *Tx) ListVerifications() []*RestoreVerification {
+	out := make([]*RestoreVerification, 0, len(tx.st.Verifications))
+	for _, v := range tx.st.Verifications {
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.Before(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
+}
+
+func (tx *Tx) PutVerification(v RestoreVerification) { tx.st.Verifications[v.ID] = &v }
 
 // PutCompaction 写入压缩任务，并登记任务号索引（首次写入时）。
 func (tx *Tx) PutCompaction(t CompactionTask) {
